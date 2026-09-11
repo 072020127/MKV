@@ -42,10 +42,164 @@ def test_prompt_ids_passes_answer_only_to_chat_template():
     assert calls[0]["enable_thinking"] is False
 
 
+def test_prompt_ids_with_last_user_span_requires_exact_template_prefix():
+    class Tokenizer:
+        def apply_chat_template(self, _messages, **kwargs):
+            return {
+                "input_ids": [1, 2, 3, 4]
+                if kwargs["add_generation_prompt"]
+                else [1, 2]
+            }
+
+    example = MODULE.LongBenchExample(
+        "id", "context", "question", ("answer",), "hotpotqa"
+    )
+    assert MODULE.prompt_ids_with_last_user_span(Tokenizer(), example, "run") == (
+        [1, 2, 3, 4],
+        (0, 2),
+    )
+
+
 def test_importance_file_is_keyed_by_prompt_hash(tmp_path):
     path = tmp_path / "importance.json"
     path.write_text('{"scores":{"abc":[0.1,0.2]}}', encoding="utf-8")
     assert MODULE.load_importance_file(str(path)) == {"abc": [0.1, 0.2]}
+
+
+def test_nonfinite_importance_is_json_safe_and_fail_closed(tmp_path):
+    path = tmp_path / "importance.json"
+    path.write_text(
+        '{"scores":{"abc":[0.1,Infinity,NaN,-Infinity]}}',
+        encoding="utf-8",
+    )
+    values = MODULE.load_importance_file(str(path))["abc"]
+    assert all(MODULE.math.isfinite(value) for value in values)
+    status = MODULE.load_importance_status_file(str(path))["abc"]
+    assert status[0]["forced_precision"] is None
+    assert [item["forced_precision"] for item in status[1:]] == [
+        "BF16",
+        "BF16",
+        "BF16",
+    ]
+
+
+def test_importance_status_file_reads_v32_attention_artifact(tmp_path):
+    path = tmp_path / "importance.json"
+    path.write_text(
+        '{"scores":{"abc":[0.1,0.2]},"attention_results":{"abc":'
+        '{"attention":{"valid_mask":[true,false],'
+        '"forced_precision_by_token":[null,"BF16"],'
+        '"reason_by_token":[null,"NO_FUTURE_PROBE"]}}}}',
+        encoding="utf-8",
+    )
+    assert MODULE.load_importance_status_file(str(path)) == {
+        "abc": [
+            {"valid_mask": True, "forced_precision": None, "reason": None},
+            {
+                "valid_mask": False,
+                "forced_precision": "BF16",
+                "reason": "NO_FUTURE_PROBE",
+            },
+        ]
+    }
+
+
+def test_precision_plan_file_is_keyed_by_prompt_hash(tmp_path):
+    path = tmp_path / "plans.json"
+    path.write_text(
+        '{"precision_plans":{"abc":{"token_count":2,"precision_by_token":['
+        '"K2V2","BF16"]}}}',
+        encoding="utf-8",
+    )
+    assert MODULE.load_precision_plan_file(str(path)) == {
+        "abc": {"token_count": 2, "precision_by_token": ["K2V2", "BF16"]}
+    }
+
+
+def test_request_completion_sends_explicit_precision_plan_without_importance():
+    captured = {}
+
+    class Response:
+        ok = True
+
+        def json(self):
+            return {"choices": [{"text": "ok"}]}
+
+    class Session:
+        def post(self, _url, *, json, **_kwargs):
+            captured.update(json)
+            return Response()
+
+    args = argparse.Namespace(
+        mode="makv",
+        scout_overlap=False,
+        require_importance_file=True,
+        risk_source="synthetic",
+        url="http://unit.test/v1/completions",
+        model="unit-test",
+        max_tokens=1,
+        generation_seed=0,
+        timeout=1.0,
+    )
+    plan = {"token_count": 2, "precision_by_token": ["K2V2", "BF16"]}
+    result = MODULE.request_completion(
+        Session(),
+        args=args,
+        ids=[1, 2],
+        stream=False,
+        precision_plan=plan,
+    )
+    assert result["text"] == "ok"
+    transfer = captured["kv_transfer_params"]
+    assert transfer["lmcache.makv_precision_plan"] == plan
+    assert transfer["prompt_token_hash"] == MODULE.prompt_token_hash([1, 2])
+    assert transfer["lmcache.prompt_token_hash"] == MODULE.prompt_token_hash([1, 2])
+    assert transfer["request_token_count"] == 2
+    assert "lmcache.makv_importance" not in transfer
+
+
+def test_request_completion_sends_attention_token_status():
+    captured = {}
+
+    class Response:
+        ok = True
+
+        def json(self):
+            return {"choices": [{"text": "ok"}]}
+
+    class Session:
+        def post(self, _url, *, json, **_kwargs):
+            captured.update(json)
+            return Response()
+
+    args = argparse.Namespace(
+        mode="makv",
+        scout_overlap=False,
+        require_importance_file=True,
+        risk_source="synthetic",
+        url="http://unit.test/v1/completions",
+        model="unit-test",
+        max_tokens=1,
+        generation_seed=0,
+        timeout=1.0,
+    )
+    status = [
+        {"valid_mask": True, "forced_precision": None, "reason": None},
+        {
+            "valid_mask": False,
+            "forced_precision": "BF16",
+            "reason": "NO_FUTURE_PROBE",
+        },
+    ]
+    MODULE.request_completion(
+        Session(),
+        args=args,
+        ids=[1, 2],
+        stream=False,
+        importance_values=[0.1, 0.0],
+        importance_status=status,
+    )
+    assert captured["kv_transfer_params"]["lmcache.makv_importance_status"] == status
 
 
 def test_load_importance_timing_reads_per_prompt_metadata(tmp_path):

@@ -6,6 +6,7 @@
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 import json
+import importlib
 import math
 import os
 from urllib.parse import urlparse
@@ -35,7 +36,10 @@ SUPPORTED_RESIDUAL_DTYPES = ("none", "float16", "float32")
 DEFAULT_MAKV_STORAGE_URL = "redis://127.0.0.1:6379/0"
 IMPORTANCE_REQUEST_KEY = "lmcache.makv_importance"
 IMPORTANCE_LAYOUT_REQUEST_KEY = "lmcache.makv_importance_layout"
+IMPORTANCE_STATUS_REQUEST_KEY = "lmcache.makv_importance_status"
 PRECISION_PLAN_REQUEST_KEY = "lmcache.makv_precision_plan"
+SCOUT_SCORE_START_REQUEST_KEY = "lmcache.makv_scout_score_start"
+SCOUT_SCORE_END_REQUEST_KEY = "lmcache.makv_scout_score_end"
 
 
 @dataclass(frozen=True)
@@ -62,6 +66,7 @@ class MaKVConfig:
     qdm_block_size: int = 32
     qdm_quantizer_version: str = "makv_per_token_head_symmetric_narrow_v1"
     scout_overlap_enabled: bool = False
+    scout_suffix_only: bool = True
     scout_url: Optional[str] = None
     scout_timeout_s: float = 60.0
     # Optional arithmetic coding built on CacheGen's existing CUDA kernels.
@@ -402,12 +407,19 @@ def validate_makv_runtime_config(config: Any) -> None:
     require_cuda = bool(extra.get("makv_require_cuda_dequant", True))
     backend = _normalize_backend(extra.get("makv_dequant_backend"))
     if require_cuda and backend == "cuda":
-        try:
-            __import__("lmcache.c_ops")
-        except ImportError as error:
+        extension_error: Exception | None = None
+        for module_name in ("lmcache.cuda_ops", "lmcache.c_ops"):
+            try:
+                importlib.import_module(module_name)
+                extension_error = None
+                break
+            except (ImportError, OSError) as error:
+                extension_error = error
+        if extension_error is not None:
             raise RuntimeError(
-                "makv_require_cuda_dequant=true but lmcache.c_ops is unavailable"
-            ) from error
+                "makv_require_cuda_dequant=true but no usable LMCache CUDA "
+                "extension (lmcache.cuda_ops or lmcache.c_ops) is available"
+            ) from extension_error
         from lmcache.v1.storage_backend.makv.paged_restore import (
             makv_paged_cuda_op_available,
         )
@@ -490,6 +502,7 @@ def get_makv_config(config: Any) -> MaKVConfig:
         scout_overlap_enabled=bool(
             extra.get("makv_scout_overlap_enabled", False)
         ),
+        scout_suffix_only=bool(extra.get("makv_scout_suffix_only", True)),
         scout_url=(
             str(extra.get("makv_scout_url") or getattr(config, "remote_url", ""))
             if extra.get("makv_scout_overlap_enabled", False)
@@ -556,6 +569,24 @@ def extract_makv_importance(
             request_configs.get(IMPORTANCE_LAYOUT_REQUEST_KEY),
         )
     return None, None
+
+
+def extract_makv_importance_status(
+    transfer_spec: Optional[dict[str, Any]],
+    request_configs: Optional[dict[str, Any]],
+) -> Any:
+    """Extract optional per-token validity/forced-precision status.
+
+    The status is independent from the floating-point importance vector. This
+    lets an uncovered token remain a finite score while staying fail-closed in
+    the allocator.
+    """
+    value = None
+    if transfer_spec is not None:
+        value = transfer_spec.get(IMPORTANCE_STATUS_REQUEST_KEY)
+    if value is None and request_configs is not None:
+        value = request_configs.get(IMPORTANCE_STATUS_REQUEST_KEY)
+    return _coerce_importance_from_request_config(value)
 
 
 def has_makv_importance(

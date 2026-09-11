@@ -25,7 +25,9 @@ import gc
 import hashlib
 import json
 import multiprocessing
+import os
 import time
+from pathlib import Path
 
 # Third Party
 import torch
@@ -77,6 +79,37 @@ logger = init_logger(__name__)
 ProcessedChunk = Tuple[CacheEngineKey, MemoryObj, int, int]
 # (list of processed chunks, total kv size)
 ProcessTokensInternalResult = Tuple[List[ProcessedChunk], int]
+
+
+def _write_makv_restore_timing_record(req_id: str, breakdown: dict[str, Any]) -> None:
+    """Persist worker-side restore timing when a benchmark explicitly opts in.
+
+    Manager health cannot see GPU-worker restore timings.  Use one append-only
+    file per worker to avoid cross-process locking while keeping the default
+    serving path unchanged when the environment variable is absent.
+    """
+    directory_name = os.getenv("MAKV_RESTORE_TIMING_DIR", "").strip()
+    if not directory_name:
+        return
+    try:
+        directory = Path(directory_name)
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"restore-{os.getpid()}.jsonl"
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(
+                json.dumps(
+                    {
+                        "pid": os.getpid(),
+                        "req_id": str(req_id),
+                        "timestamp": time.time(),
+                        "breakdown": breakdown,
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+    except (OSError, TypeError, ValueError) as error:
+        logger.warning("Unable to persist MaKV restore timing: %s", error)
 
 
 class CacheEngineEndSignal:
@@ -586,6 +619,8 @@ class LMCacheEngine:
                     kwargs.get("request_token_count"),
                     tokens,
                     req_id,
+                    kwargs.get("scout_score_start"),
+                    kwargs.get("scout_score_end"),
                 )
 
                 def log_deferred_failure(completed_future) -> None:
@@ -619,6 +654,8 @@ class LMCacheEngine:
                     request_id=req_id,
                     token_count=kwargs.get("request_token_count"),
                     request_configs=kwargs.get("request_configs"),
+                    score_start=kwargs.get("scout_score_start"),
+                    score_end=kwargs.get("scout_score_end"),
                 )
                 kwargs["request_configs"] = resolved_request_configs
                 timing = (resolved_request_configs or {}).get(
@@ -666,11 +703,19 @@ class LMCacheEngine:
                     and "lmcache.makv_precision_plan" in request_configs
                     and "prompt_token_hash" not in transfer_spec
                 ):
-                    token_ids = convert_tokens_to_list(tokens, 0, len(tokens) - 1)
-                    encoded = ",".join(str(int(value)) for value in token_ids).encode()
-                    transfer_spec["prompt_token_hash"] = hashlib.sha256(
-                        encoded
-                    ).hexdigest()
+                    request_hash = request_configs.get("lmcache.prompt_token_hash")
+                    if request_hash:
+                        transfer_spec["prompt_token_hash"] = str(request_hash)
+                    else:
+                        token_ids = convert_tokens_to_list(
+                            tokens, 0, len(tokens) - 1
+                        )
+                        encoded = ",".join(
+                            str(int(value)) for value in token_ids
+                        ).encode()
+                        transfer_spec["prompt_token_hash"] = hashlib.sha256(
+                            encoded
+                        ).hexdigest()
             else:
                 transfer_spec = raw_transfer_spec
             # TODO: we implicitly rely on batched_put to call ref_count_down
@@ -713,6 +758,8 @@ class LMCacheEngine:
         request_token_count: Optional[int],
         tokens: Optional[Union[torch.Tensor, list[int]]],
         req_id: Optional[str],
+        scout_score_start: Optional[int] = None,
+        scout_score_end: Optional[int] = None,
     ) -> None:
         """Join ScoutRank and submit a PUT without blocking chunked prefill."""
         resolved_configs = request_configs
@@ -727,6 +774,8 @@ class LMCacheEngine:
                 token_count=request_token_count,
                 request_configs=request_configs,
                 deferred=True,
+                score_start=scout_score_start,
+                score_end=scout_score_end,
             )
             timing = (resolved_configs or {}).get(
                 "lmcache.makv_scoutrank_timing"
@@ -759,9 +808,15 @@ class LMCacheEngine:
             and "lmcache.makv_precision_plan" in resolved_configs
             and "prompt_token_hash" not in transfer_spec
         ):
-            token_ids = convert_tokens_to_list(tokens, 0, len(tokens) - 1)
-            encoded = ",".join(str(int(value)) for value in token_ids).encode()
-            transfer_spec["prompt_token_hash"] = hashlib.sha256(encoded).hexdigest()
+            request_hash = resolved_configs.get("lmcache.prompt_token_hash")
+            if request_hash:
+                transfer_spec["prompt_token_hash"] = str(request_hash)
+            else:
+                token_ids = convert_tokens_to_list(tokens, 0, len(tokens) - 1)
+                encoded = ",".join(str(int(value)) for value in token_ids).encode()
+                transfer_spec["prompt_token_hash"] = hashlib.sha256(
+                    encoded
+                ).hexdigest()
 
         assert self.storage_manager is not None
         try:
@@ -1358,6 +1413,7 @@ class LMCacheEngine:
                     req_id,
                     json.dumps(breakdown, sort_keys=True),
                 )
+                _write_makv_restore_timing_record(req_id, breakdown)
         return ret_mask
 
     @_lmcache_nvtx_annotate

@@ -22,6 +22,7 @@ from lmcache.v1.memory_management import (
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.makv.config import (
     extract_makv_importance,
+    extract_makv_importance_status,
     extract_makv_precision_plan,
     get_makv_config,
 )
@@ -94,6 +95,10 @@ class MaKVSerializer(Serializer):
             transfer_spec,
             request_configs,
         )
+        importance_status = extract_makv_importance_status(
+            transfer_spec,
+            request_configs,
+        )
         if precision_plan is None and importance is None:
             logger.warning(
                 "MaKV PUT is missing importance; request_config_keys=%s "
@@ -162,6 +167,7 @@ class MaKVSerializer(Serializer):
                 plan = build_chunk_quant_plan(
                     importance=importance,
                     importance_layout_hint=importance_layout,
+                    importance_status=importance_status,
                     **common,
                 )
         except (KeyError, TypeError, ValueError) as error:

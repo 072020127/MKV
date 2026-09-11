@@ -327,6 +327,73 @@ def test_build_chunk_quant_plan_is_deterministic_and_protects_prefix_tail():
     assert bucket_ids[1] <= bucket_ids[2]
 
 
+def test_importance_status_forces_uncovered_tokens_to_bf16(tmp_path):
+    from lmcache.v1.storage_backend.makv.config import get_makv_config
+
+    config = _make_config(
+        tmp_path,
+        makv_bucket_ratios=[0.1, 0.2, 0.5, 0.2],
+        makv_bucket_bits=[16, 8, 4, 2],
+        makv_precision_scheme="kv_separate_4tier",
+    )
+    status = [
+        {"valid_mask": True, "forced_precision": None},
+        {"valid_mask": False, "forced_precision": "BF16", "reason": "NO_FUTURE_PROBE"},
+        {"valid_mask": True, "forced_precision": None},
+        {"valid_mask": True, "forced_precision": None},
+    ]
+    plan = build_chunk_quant_plan(
+        importance=[100.0, -100.0, 1.0, 0.0],
+        importance_layout_hint="token",
+        chunk_start=0,
+        chunk_end=4,
+        original_shape=(2, 2, 4, 4),
+        original_strides=(32, 16, 4, 1),
+        original_dtype="torch.float16",
+        token_dim=2,
+        num_layers=2,
+        num_kv_heads=2,
+        head_dim=4,
+        model_name="m",
+        world_size=1,
+        worker_id=0,
+        config=get_makv_config(config),
+        importance_status=status,
+    )
+    # The physical layout is layer-major, K/V-major, token-major.  BF16 is
+    # bucket zero for both planes, including the uncovered token's K and V.
+    for layer in range(2):
+        for kv in range(2):
+            assert plan.bucket_ids[(layer * 2 + kv) * 4 + 1] == 0
+
+
+def test_importance_status_rejects_invalid_non_bf16_force(tmp_path):
+    from lmcache.v1.storage_backend.makv.config import get_makv_config
+
+    with pytest.raises(ValueError, match="must force BF16"):
+        build_chunk_quant_plan(
+            importance=[0.0, 1.0],
+            importance_layout_hint="token",
+            chunk_start=0,
+            chunk_end=2,
+            original_shape=(1, 2, 2, 4),
+            original_strides=(16, 8, 4, 1),
+            original_dtype="torch.float16",
+            token_dim=2,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=4,
+            model_name="m",
+            world_size=1,
+            worker_id=0,
+            config=get_makv_config(_make_config(tmp_path)),
+            importance_status=[
+                {"valid_mask": True, "forced_precision": None},
+                {"valid_mask": False, "forced_precision": None},
+            ],
+        )
+
+
 def test_build_chunk_quant_plan_layer_kv_layout(tmp_path):
     config = _make_config(tmp_path)
     from lmcache.v1.storage_backend.makv.config import get_makv_config

@@ -8,7 +8,8 @@ import pytest
 import torch
 
 # First Party
-import lmcache.c_ops as lmc_ops
+import lmcache.cuda_ops as lmc_ops
+import lmcache.lmcache_native as lmcache_native
 import lmcache.v1.gpu_connector.gpu_connectors as gpu_connectors
 from lmcache.v1.gpu_connector.gpu_connectors import VLLMPagedMemGPUConnectorV2
 from lmcache.v1.gpu_connector.makv_restore import (
@@ -266,8 +267,8 @@ def _run_paths(
             slots,
             torch.device("cuda"),
             num_blocks * block_size,
-            lmc_ops.TransferDirection.H2D,
-            lmc_ops.EngineKVFormat(engine_format),
+            lmcache_native.TransferDirection.H2D,
+            lmcache_native.EngineKVFormat(engine_format),
             block_size=block_size,
             head_size=head_dim,
         )
@@ -279,7 +280,7 @@ def _run_paths(
             page_buffer_size=num_blocks * block_size,
             block_size=block_size,
             head_size=head_dim,
-            engine_kv_format=lmc_ops.EngineKVFormat(engine_format),
+            engine_kv_format=lmcache_native.EngineKVFormat(engine_format),
         )
     stream.synchronize()
     return path_a, path_b
@@ -421,7 +422,7 @@ def test_direct_paged_fused_content_layouts(engine_format):
         page_buffer_size=num_blocks * block_size,
         block_size=block_size,
         head_size=2 * head_dim,
-        engine_kv_format=lmc_ops.EngineKVFormat(engine_format),
+        engine_kv_format=lmcache_native.EngineKVFormat(engine_format),
     )
     torch.cuda.synchronize()
     assert all(
@@ -471,7 +472,7 @@ def test_direct_paged_rejects_duplicate_positions_before_write():
             page_buffer_size=20,
             block_size=4,
             head_size=5,
-            engine_kv_format=lmc_ops.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS,
+            engine_kv_format=lmcache_native.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS,
         )
     assert torch.count_nonzero(cache).item() == 0
 
@@ -503,7 +504,7 @@ def test_direct_paged_cuda_events_report_h2d_and_kernel_time():
         page_buffer_size=20,
         block_size=block_size,
         head_size=head_dim,
-        engine_kv_format=lmc_ops.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS,
+        engine_kv_format=lmcache_native.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS,
     )
     torch.cuda.synchronize()
     timing = RESTORE_METRICS.snapshot()

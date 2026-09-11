@@ -70,6 +70,9 @@ class LoadSpec:
     lmcache_cached_tokens: int
     # Whether the scheduler allow us to load the tokens
     can_load: bool
+    # Absolute request range scored by the overlapped MaKV ScoutRank job.
+    scout_score_start: Optional[int] = None
+    scout_score_end: Optional[int] = None
 
 
 @dataclass
@@ -144,6 +147,11 @@ class RequestTracker:
 
     # The number of tokens that are cached in LMCache for this request
     num_lmcache_cached_tokens: int = 0
+
+    # Request-local ScoutRank range.  These fields avoid putting scheduler
+    # state in a process-global cache or changing the cache key.
+    scout_score_start: Optional[int] = None
+    scout_score_end: Optional[int] = None
 
     @_lmcache_nvtx_annotate
     @staticmethod
@@ -297,6 +305,9 @@ class ReqMeta:
     disagg_spec: Optional[DisaggSpec] = None
     # the configs of the request
     request_configs: Optional[dict] = None
+    # Absolute ScoutRank range, copied from the request tracker.
+    scout_score_start: Optional[int] = None
+    scout_score_end: Optional[int] = None
 
     @staticmethod
     def from_request_tracker(
@@ -437,6 +448,8 @@ class ReqMeta:
             load_spec=load_spec,
             disagg_spec=tracker.disagg_spec,
             request_configs=tracker.request_configs,
+            scout_score_start=tracker.scout_score_start,
+            scout_score_end=tracker.scout_score_end,
         )
 
 
@@ -1259,6 +1272,8 @@ class LMCacheConnectorV1Impl:
                 request_configs=request.request_configs,
                 request_token_count=request.prompt_len,
                 req_id=request.req_id,
+                scout_score_start=request.scout_score_start,
+                scout_score_end=request.scout_score_end,
             )
 
             # Probe decoder cache after store
@@ -1505,6 +1520,7 @@ class LMCacheConnectorV1Impl:
             return 0
 
         req_id = request.request_id
+        request_configs = extract_request_configs(request.sampling_params)
 
         # Degraded mode (LMCache init failed): no lookup client is available, so
         # report no external hits and let vLLM recompute instead of asserting and
@@ -1537,7 +1553,6 @@ class LMCacheConnectorV1Impl:
                 apply_mm_hashes_to_token_ids(token_ids, mm_hashes, mm_positions)
                 token_ids = token_ids.tolist()
 
-            request_configs = extract_request_configs(request.sampling_params)
             if self.skip_last_n_tokens > 0:
                 token_ids = token_ids[: -self.skip_last_n_tokens]
 
@@ -1557,6 +1572,7 @@ class LMCacheConnectorV1Impl:
             )
             return None
 
+        scout_score_range: Optional[tuple[int, int]] = None
         if (
             self.kv_role != "kv_consumer"
             and self.config.remote_serde == "makv"
@@ -1566,16 +1582,21 @@ class LMCacheConnectorV1Impl:
                 # before vLLM prefill. The worker later joins this req_id at
                 # LMCacheEngine.store after its existing GPU-to-CPU KV copy.
                 from lmcache.v1.storage_backend.makv.scout_overlap import (
+                    get_scout_score_range,
                     submit_scout_if_needed,
                 )
 
+                scout_score_range = get_scout_score_range(
+                    self.config,
+                    token_count=len(request.prompt_token_ids),
+                    cached_tokens=num_external_hit_tokens,
+                    request_configs=request_configs,
+                )
                 submit_scout_if_needed(
                     self.config,
                     request_id=req_id,
                     token_ids=request.prompt_token_ids,
-                    request_configs=extract_request_configs(
-                        request.sampling_params
-                    ),
+                    request_configs=request_configs,
                     cached_tokens=num_external_hit_tokens,
                 )
             except Exception as error:
@@ -1665,6 +1686,12 @@ class LMCacheConnectorV1Impl:
             vllm_cached_tokens=num_computed_tokens,
             lmcache_cached_tokens=capped_lmcache_tokens,
             can_load=False,
+            scout_score_start=(
+                None if scout_score_range is None else scout_score_range[0]
+            ),
+            scout_score_end=(
+                None if scout_score_range is None else scout_score_range[1]
+            ),
         )
 
         if below_min_retrieve or need_to_allocate <= 0:
@@ -1812,6 +1839,9 @@ class LMCacheConnectorV1Impl:
                 lmcache_cached_tokens,
                 skip_save,
             )
+            if load_spec is not None:
+                request_tracker.scout_score_start = load_spec.scout_score_start
+                request_tracker.scout_score_end = load_spec.scout_score_end
             self._request_trackers[request.req_id] = request_tracker
 
             req_meta = ReqMeta.from_request_tracker(
@@ -1839,6 +1869,9 @@ class LMCacheConnectorV1Impl:
                     lmcache_cached_tokens = load_spec.lmcache_cached_tokens
                     vllm_cached_tokens = load_spec.vllm_cached_tokens
                 request_tracker = self._request_trackers[req.req_id]
+                if load_spec is not None:
+                    request_tracker.scout_score_start = load_spec.scout_score_start
+                    request_tracker.scout_score_end = load_spec.scout_score_end
 
                 # Pass all_token_ids for preempted requests to restore
                 # token_ids correctly for chunk key computation
@@ -1899,6 +1932,10 @@ class LMCacheConnectorV1Impl:
             if load_spec is not None:
                 lmcache_cached_tokens = load_spec.lmcache_cached_tokens
                 vllm_cached_tokens = load_spec.vllm_cached_tokens
+
+            if load_spec is not None:
+                request_tracker.scout_score_start = load_spec.scout_score_start
+                request_tracker.scout_score_end = load_spec.scout_score_end
 
             # Handle both old and new versions of CachedRequestData
             if hasattr(cached_reqs, "resumed_req_ids"):

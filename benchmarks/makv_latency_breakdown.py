@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 import argparse
 import asyncio
+import importlib
 import json
 import math
 import socket
@@ -34,7 +35,7 @@ import uuid
 import torch
 
 # First Party
-import lmcache.c_ops as lmc_ops
+import lmcache.lmcache_native as lmcache_native
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import (
     MemoryFormat,
@@ -227,6 +228,8 @@ def _start_manager(args: argparse.Namespace) -> _ManagedServer:
         args.entropy_codec,
         "--entropy-backend",
         args.entropy_backend,
+        "--residual-dtype",
+        args.residual_dtype,
     ]
     if args.trust_validated_objects:
         command.append("--trust-validated-objects")
@@ -265,6 +268,7 @@ def _make_config(
             "makv_entropy_codec": args.entropy_codec,
             "makv_entropy_backend": args.entropy_backend,
             "makv_entropy_require_cuda": args.entropy_require_cuda,
+            "makv_residual_dtype": args.residual_dtype,
             "makv_batch_blob": args.batch_blob,
             "makv_streaming_restore": args.streaming_restore,
         },
@@ -293,7 +297,7 @@ def _restore_batch(
             page_buffer_size=page_buffer_size,
             block_size=args.block_size,
             head_size=args.head_dim,
-            engine_kv_format=lmc_ops.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS,
+            engine_kv_format=lmcache_native.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS,
             timing_scope=scope,
         )
     torch.cuda.synchronize(device)
@@ -338,7 +342,7 @@ async def _fetch_and_restore_streaming(
             page_buffer_size=page_buffer_size,
             block_size=args.block_size,
             head_size=args.head_dim,
-            engine_kv_format=lmc_ops.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS,
+            engine_kv_format=lmcache_native.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS,
             timing_scope=scope,
         )
         received += 1
@@ -365,6 +369,7 @@ async def _delete_keys(connector: MaKVNetworkConnector, keys: list[_Key]) -> Non
 
 
 async def _run(args: argparse.Namespace) -> dict[str, Any]:
+    importlib.import_module("lmcache.cuda_ops")
     if not torch.cuda.is_available() or not makv_paged_cuda_op_available():
         raise RuntimeError("This benchmark requires the built MaKV CUDA operator")
     if args.chunks <= 0 or args.iterations <= 0 or args.chunk_tokens <= 0:
@@ -628,6 +633,7 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
                 "backend": args.entropy_backend,
                 "require_cuda": args.entropy_require_cuda,
             },
+            "residual_dtype": args.residual_dtype,
             "transport_options": {
                 "batch_blob": args.batch_blob,
                 "streaming_restore": args.streaming_restore,
@@ -649,6 +655,9 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
                         "makv_client_raw_payload_copy_time_ms",
                         "makv_client_envelope_encode_time_ms",
                         "makv_client_serialize_total_time_ms",
+                        "makv_client_quantize_calls",
+                        "makv_put_raw_bytes",
+                        "makv_put_plan_bytes",
                         "makv_client_put_connect_time_ms",
                         "makv_client_put_send_time_ms",
                         "makv_client_put_response_time_ms",
@@ -804,6 +813,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
     )
     parser.add_argument("--entropy-require-cuda", action="store_true")
+    parser.add_argument(
+        "--residual-dtype",
+        choices=("none", "float16", "float32"),
+        default="none",
+        help="Store manager-side residuals for later precision upgrades.",
+    )
     parser.add_argument("--output", type=Path, default=None)
     return parser
 

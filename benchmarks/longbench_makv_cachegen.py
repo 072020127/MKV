@@ -98,6 +98,31 @@ def load_examples(
     return rows
 
 
+def _longbench_user_messages(
+    example: LongBenchExample,
+    run_id: str,
+) -> list[dict[str, str]]:
+    """Build LongBench's single-user chat message deterministically."""
+    case_id = hashlib.sha256(f"{run_id}:{example.example_id}".encode()).hexdigest()
+    prompt = (
+        f"Evaluation case identifier: {case_id}.\n"
+        "Use the context to answer the question. Keep the answer concise.\n\n"
+        f"Context:\n{example.context}\n\nQuestion:\n{example.question}\n\n"
+        "Answer:"
+    )
+    return [{"role": "user", "content": prompt}]
+
+
+def _input_ids_from_chat_encoding(encoded: Any) -> list[int]:
+    """Normalize a tokenizer chat-template result to one unbatched ID list."""
+    ids = encoded.get("input_ids") if hasattr(encoded, "get") else encoded
+    if ids and isinstance(ids[0], list):
+        if len(ids) != 1:
+            raise ValueError("LongBench runner only supports batch size 1")
+        ids = ids[0]
+    return [int(value) for value in ids]
+
+
 def prompt_ids(
     tokenizer: Any,
     example: LongBenchExample,
@@ -111,25 +136,49 @@ def prompt_ids(
     extractive QA metrics expect an answer, not an unfinished reasoning trace,
     so answer-only is the default and reasoning must be explicitly requested.
     """
-    case_id = hashlib.sha256(f"{run_id}:{example.example_id}".encode()).hexdigest()
-    prompt = (
-        f"Evaluation case identifier: {case_id}.\n"
-        "Use the context to answer the question. Keep the answer concise.\n\n"
-        f"Context:\n{example.context}\n\nQuestion:\n{example.question}\n\n"
-        "Answer:"
-    )
     encoded = tokenizer.apply_chat_template(
-        [{"role": "user", "content": prompt}],
+        _longbench_user_messages(example, run_id),
         tokenize=True,
         add_generation_prompt=True,
         enable_thinking=enable_thinking,
     )
-    ids = encoded.get("input_ids") if hasattr(encoded, "get") else encoded
-    if ids and isinstance(ids[0], list):
-        if len(ids) != 1:
-            raise ValueError("LongBench runner only supports batch size 1")
-        ids = ids[0]
-    return list(ids)
+    return _input_ids_from_chat_encoding(encoded)
+
+
+def prompt_ids_with_last_user_span(
+    tokenizer: Any,
+    example: LongBenchExample,
+    run_id: str,
+    *,
+    enable_thinking: bool = False,
+) -> tuple[list[int], tuple[int, int] | None]:
+    """Encode LongBench prompt IDs and its exact final user-turn span.
+
+    LongBench constructs one user message. For the Qwen chat template, the
+    encoding without the generation prompt must be an exact prefix of the
+    generation-ready prompt; otherwise this function returns ``None`` rather
+    than guessing a span.
+    """
+    messages = _longbench_user_messages(example, run_id)
+    full_ids = _input_ids_from_chat_encoding(
+        tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            enable_thinking=enable_thinking,
+        )
+    )
+    user_turn_ids = _input_ids_from_chat_encoding(
+        tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=False,
+            enable_thinking=enable_thinking,
+        )
+    )
+    if user_turn_ids and full_ids[: len(user_turn_ids)] == user_turn_ids:
+        return full_ids, (0, len(user_turn_ids))
+    return full_ids, None
 
 
 def importance(token_count: int) -> list[float]:
@@ -140,6 +189,18 @@ def importance(token_count: int) -> list[float]:
 def prompt_token_hash(ids: list[int]) -> str:
     """Hash token IDs using the same representation as ScoutRank artifacts."""
     return hashlib.sha256(",".join(str(value) for value in ids).encode()).hexdigest()
+
+
+# JSON (and the vLLM HTTP request model) cannot carry NaN/Inf.  Keep the
+# value inside float32 range so the server-side plan builder sees a finite
+# score; the derived status below preserves the fail-closed BF16 assignment.
+_JSON_SAFE_NONFINITE_IMPORTANCE = float.fromhex("0x1.fffffep+127")
+
+
+def _json_safe_importance(value: Any) -> float:
+    """Encode a non-finite ScoutRank safety score for the JSON transport."""
+    value = float(value)
+    return value if math.isfinite(value) else _JSON_SAFE_NONFINITE_IMPORTANCE
 
 
 def load_importance_file(path: str | None) -> dict[str, list[float]]:
@@ -154,7 +215,112 @@ def load_importance_file(path: str | None) -> dict[str, list[float]]:
     for key, values in scores.items():
         if not isinstance(values, list):
             raise ValueError(f"importance scores for {key!r} must be a list")
-        result[str(key)] = [float(value) for value in values]
+        result[str(key)] = [_json_safe_importance(value) for value in values]
+    return result
+
+
+def load_importance_status_file(
+    path: str | None,
+) -> dict[str, list[dict[str, Any]]]:
+    """Load v3.2 token validity and forced-BF16 status from an artifact."""
+    if not path:
+        return {}
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("importance status file must contain an object")
+    direct = payload.get("token_status")
+    attention_results = payload.get("attention_results")
+    source = direct if isinstance(direct, dict) else attention_results
+    if source is None:
+        # The exact D22 artifact intentionally represents uncovered tokens as
+        # +Inf, but older artifacts do not persist a separate status map.
+        # Reconstruct the equivalent fail-closed status before the vector is
+        # sent over JSON.  This keeps those tokens out of ratio allocation.
+        raw_scores = payload.get("scores")
+        if not isinstance(raw_scores, dict):
+            return {}
+        derived: dict[str, list[dict[str, Any]]] = {}
+        for key, values in raw_scores.items():
+            if not isinstance(values, list):
+                continue
+            if not any(not math.isfinite(float(value)) for value in values):
+                continue
+            derived[str(key)] = [
+                {
+                    "valid_mask": math.isfinite(float(value)),
+                    "forced_precision": (
+                        None
+                        if math.isfinite(float(value))
+                        else "BF16"
+                    ),
+                    "reason": (
+                        None
+                        if math.isfinite(float(value))
+                        else "NONFINITE_IMPORTANCE"
+                    ),
+                }
+                for value in values
+            ]
+        return derived
+    if not isinstance(source, dict):
+        raise ValueError("importance status map must be hash-keyed")
+    result: dict[str, list[dict[str, Any]]] = {}
+    for key, item in source.items():
+        details = item.get("attention", item) if isinstance(item, dict) else None
+        if not isinstance(details, dict):
+            raise ValueError(f"importance status for {key!r} must be an object")
+        statuses = details.get("token_status")
+        if statuses is None:
+            valid_mask = details.get("valid_mask")
+            forced = details.get("forced_precision_by_token")
+            reasons = details.get("reason_by_token")
+            if not isinstance(valid_mask, list):
+                continue
+            if forced is None:
+                forced = [None] * len(valid_mask)
+            if reasons is None:
+                reasons = [None] * len(valid_mask)
+            if (
+                not isinstance(forced, list)
+                or not isinstance(reasons, list)
+                or len(forced) != len(valid_mask)
+                or len(reasons) != len(valid_mask)
+            ):
+                raise ValueError(f"importance status lengths mismatch for {key!r}")
+            statuses = [
+                {
+                    "valid_mask": bool(valid),
+                    "forced_precision": precision,
+                    "reason": reason,
+                }
+                for valid, precision, reason in zip(
+                    valid_mask, forced, reasons, strict=True
+                )
+            ]
+        if not isinstance(statuses, list):
+            raise ValueError(f"importance status for {key!r} must be a list")
+        result[str(key)] = statuses
+    return result
+
+
+def load_precision_plan_file(path: str | None) -> dict[str, dict[str, Any]]:
+    """Load prompt-hash keyed explicit MaKV precision plans from JSON.
+
+    A ScoutRank-v3 artifact generated with ``--v3-mckp-budget-bytes`` contains
+    a top-level ``precision_plans`` map. The plans remain opaque here because
+    MaKV validates their token hash, schema, and deployment gate at PUT time.
+    """
+    if not path:
+        return {}
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    plans = payload.get("precision_plans") if isinstance(payload, dict) else None
+    if not isinstance(plans, dict):
+        raise ValueError("precision-plan file must contain a hash->plan map")
+    result: dict[str, dict[str, Any]] = {}
+    for key, plan in plans.items():
+        if not isinstance(plan, dict):
+            raise ValueError(f"precision plan for {key!r} must be an object")
+        result[str(key)] = plan
     return result
 
 
@@ -234,24 +400,43 @@ def request_completion(
     stream: bool = True,
     max_tokens: int | None = None,
     importance_values: list[float] | None = None,
+    importance_status: list[dict[str, Any]] | None = None,
+    precision_plan: dict[str, Any] | None = None,
     risk_token_indices: list[int] | None = None,
     runtime_risk_enabled: bool = True,
 ) -> dict[str, Any]:
     transfer: dict[str, Any] = {"cached_token_stats": True}
     if args.mode == "makv" and not getattr(args, "scout_overlap", False):
-        if importance_values is None:
+        if precision_plan is not None:
+            transfer["lmcache.makv_precision_plan"] = precision_plan
+            # MaKV validates the plan against the exact prompt IDs reaching
+            # the worker; never trust a hash copied from an artifact.
+            # Keep the hash in request configs so LMCache can carry it across
+            # chunk alignment, where the stored token slice may be shorter
+            # than the complete prompt.
+            full_prompt_hash = prompt_token_hash(ids)
+            transfer["prompt_token_hash"] = full_prompt_hash
+            transfer["lmcache.prompt_token_hash"] = full_prompt_hash
+            # The serializer may receive one cache tensor per chunk. Preserve
+            # the request-wide length so v3 slices the global assignment.
+            transfer["request_token_count"] = len(ids)
+        elif importance_values is None:
             if getattr(args, "require_importance_file", False):
                 raise ValueError(
-                    "MaKV validation requires --importance-file; refusing "
-                    "to use the placeholder importance vector"
+                    "MaKV validation requires --importance-file or "
+                    "--precision-plan-file; refusing to use the placeholder "
+                    "importance vector"
                 )
             importance_values = importance(len(ids))
-        transfer.update(
-            {
-                "lmcache.makv_importance": importance_values,
-                "lmcache.makv_importance_layout": "token",
-            }
-        )
+        if precision_plan is None:
+            transfer.update(
+                {
+                    "lmcache.makv_importance": importance_values,
+                    "lmcache.makv_importance_layout": "token",
+                }
+            )
+            if importance_status is not None:
+                transfer["lmcache.makv_importance_status"] = importance_status
         if getattr(args, "risk_source", "synthetic") == "runtime_conf":
             if not risk_token_indices:
                 raise ValueError(
@@ -745,6 +930,9 @@ def run(args: argparse.Namespace) -> None:
         Path(args.dataset_path), args.task, args.limit, args.offset
     )
     importance_by_hash = load_importance_file(args.importance_file)
+    importance_status_by_hash = load_importance_status_file(args.importance_file)
+    precision_plan_file = getattr(args, "precision_plan_file", None)
+    precision_plans_by_hash = load_precision_plan_file(precision_plan_file)
     include_scoutrank_time = bool(getattr(args, "include_scoutrank_time", False))
     require_scoutrank_timing = bool(
         getattr(args, "require_scoutrank_timing", False)
@@ -760,6 +948,18 @@ def run(args: argparse.Namespace) -> None:
             f"{args.importance_file}",
             flush=True,
         )
+        if importance_status_by_hash:
+            print(
+                f"Loaded {len(importance_status_by_hash)} token-status vectors from "
+                f"{args.importance_file}",
+                flush=True,
+            )
+    if args.mode == "makv" and precision_plan_file:
+        print(
+            f"Loaded {len(precision_plans_by_hash)} explicit MaKV precision plans "
+            f"from {precision_plan_file}",
+            flush=True,
+        )
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     records: list[dict[str, Any]] = []
@@ -773,11 +973,25 @@ def run(args: argparse.Namespace) -> None:
             )
             token_hash = prompt_token_hash(ids)
             importance_values = importance_by_hash.get(token_hash)
+            importance_status = importance_status_by_hash.get(token_hash)
+            precision_plan = precision_plans_by_hash.get(token_hash)
             if args.mode == "makv" and importance_values is not None:
                 if len(importance_values) != len(ids):
                     raise ValueError(
                         f"importance length mismatch for {example.example_id}: "
                         f"{len(importance_values)} != {len(ids)}"
+                    )
+            if args.mode == "makv" and precision_plan is not None:
+                if int(precision_plan.get("token_count", -1)) != len(ids):
+                    raise ValueError(
+                        f"precision-plan length mismatch for {example.example_id}: "
+                        f"{precision_plan.get('token_count')} != {len(ids)}"
+                    )
+            if args.mode == "makv" and importance_status is not None:
+                if len(importance_status) != len(ids):
+                    raise ValueError(
+                        f"importance status length mismatch for {example.example_id}: "
+                        f"{len(importance_status)} != {len(ids)}"
                     )
             scoutrank_time_ms = 0.0
             if include_scoutrank_time and args.mode == "makv":
@@ -794,6 +1008,8 @@ def run(args: argparse.Namespace) -> None:
                 args=args,
                 ids=ids,
                 importance_values=importance_values,
+                importance_status=importance_status,
+                precision_plan=precision_plan,
             )
             attach_scoutrank_timing(cold, scoutrank_time_ms)
             cold["answer_text"] = extract_answer_text(cold["text"])
@@ -812,6 +1028,8 @@ def run(args: argparse.Namespace) -> None:
                 stream=False,
                 max_tokens=1,
                 importance_values=importance_values,
+                importance_status=importance_status,
+                precision_plan=precision_plan,
             )
             for _ in range(args.hit_retries):
                 if (
@@ -828,6 +1046,8 @@ def run(args: argparse.Namespace) -> None:
                     stream=False,
                     max_tokens=1,
                     importance_values=importance_values,
+                    importance_status=importance_status,
+                    precision_plan=precision_plan,
                 )
             if probe["cached_tokens"] is None:
                 raise RuntimeError(
@@ -842,6 +1062,8 @@ def run(args: argparse.Namespace) -> None:
                 args=args,
                 ids=ids,
                 importance_values=importance_values,
+                importance_status=importance_status,
+                precision_plan=precision_plan,
             )
             attach_scoutrank_timing(hit, scoutrank_time_ms)
             hit["answer_text"] = extract_answer_text(hit["text"])
@@ -868,9 +1090,25 @@ def run(args: argparse.Namespace) -> None:
                 "importance_source": (
                     "scoutrank_overlap"
                     if getattr(args, "scout_overlap", False)
+                    else "scoutrank_v3_mckp_file"
+                    if precision_plan is not None
                     else "scoutrank_file"
                     if importance_values is not None
                     else "placeholder"
+                ),
+                "importance_status_source": (
+                    "scoutrank_attention_v3.2"
+                    if importance_status is not None
+                    else None
+                ),
+                "forced_bf16_token_count": (
+                    sum(
+                        item.get("forced_precision") == "BF16"
+                        or item.get("valid_mask") is False
+                        for item in importance_status
+                    )
+                    if importance_status is not None
+                    else 0
                 ),
                 "scoutrank_time_ms": scoutrank_time_ms,
                 "answers": list(example.answers),
@@ -954,6 +1192,14 @@ def main() -> None:
         "--importance-file",
         default=None,
         help="JSON artifact mapping prompt token hash to [T] importance scores.",
+    )
+    parser.add_argument(
+        "--precision-plan-file",
+        default=None,
+        help=(
+            "Optional ScoutRank-v3 artifact with top-level precision_plans; "
+            "uses explicit MCKP assignments instead of rank buckets."
+        ),
     )
     parser.add_argument(
         "--require-importance-file",

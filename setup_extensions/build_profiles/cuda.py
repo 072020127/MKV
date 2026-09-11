@@ -151,6 +151,10 @@ class CudaProfile(BuildProfile):
             "csrc/makv_ops.cpp",
             "csrc/dequantize_scatter_cuda.cu",
             "csrc/makv_paged_cuda.cu",
+            "csrc/fast_d22_ops.cpp",
+            "csrc/fast_d22_cuda.cu",
+            "csrc/fast_1_exact_scalar_d22_ops.cpp",
+            "csrc/fast_1_exact_scalar_d22_cuda.cu",
         ]
         max_jobs, nvcc_threads, export_jobs = resolve_build_parallelism()
         if export_jobs:

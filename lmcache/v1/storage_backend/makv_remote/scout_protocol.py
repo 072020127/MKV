@@ -8,7 +8,11 @@ from collections.abc import Iterable, Sequence
 import hashlib
 import sys
 
+# Version 1 is the original full-prompt protocol.  Version 2 adds an
+# explicit absolute score range so a client can submit only an uncached
+# suffix while retaining request-level layout metadata.
 SCOUT_PROTOCOL_VERSION = 1
+SCOUT_SUFFIX_PROTOCOL_VERSION = 2
 
 
 def _network_order_array(typecode: str, values: Iterable[int | float]) -> bytes:
@@ -62,3 +66,17 @@ def decode_scores(payload: bytes, token_count: int) -> list[float]:
 def payload_sha256(payload: bytes) -> str:
     """Return the stable content identity used for idempotent submissions."""
     return hashlib.sha256(payload).hexdigest()
+
+
+def score_context_sha256(
+    token_sha256: str, score_start: int, full_token_count: int
+) -> str:
+    """Hash a score payload together with its absolute request range.
+
+    The token payload alone is not a safe cross-request identity for
+    suffix-only scoring: the same suffix at different absolute positions can
+    represent different scorer inputs.  Including the range prevents an
+    incorrect prompt-hash cache reuse.
+    """
+    context = f"{token_sha256}:{int(score_start)}:{int(full_token_count)}"
+    return hashlib.sha256(context.encode("ascii")).hexdigest()

@@ -37,9 +37,11 @@ from lmcache.v1.storage_backend.makv_remote.protocol import (
 )
 from lmcache.v1.storage_backend.makv_remote.scout_protocol import (
     SCOUT_PROTOCOL_VERSION,
+    SCOUT_SUFFIX_PROTOCOL_VERSION,
     decode_token_ids,
     encode_scores,
     payload_sha256,
+    score_context_sha256,
 )
 from lmcache.v1.storage_backend.makv_remote.scout_service import ScoutJobService
 from lmcache.v1.storage_backend.makv_remote.storage_adapter import (
@@ -458,8 +460,10 @@ class MaKVRemoteServer:
         if operation in ("SCOUT_SUBMIT", "SCOUT_WAIT"):
             if self.scout_service is None:
                 raise RuntimeError("ScoutRank service is not enabled")
-            if int(request_header.get("protocol_version", -1)) != (
-                SCOUT_PROTOCOL_VERSION
+            protocol_version = int(request_header.get("protocol_version", -1))
+            if protocol_version not in (
+                SCOUT_PROTOCOL_VERSION,
+                SCOUT_SUFFIX_PROTOCOL_VERSION,
             ):
                 raise ValueError("unsupported ScoutRank protocol version")
             token_count = int(request_header.get("token_count", -1))
@@ -468,22 +472,70 @@ class MaKVRemoteServer:
                 if not token_sha256 or payload_sha256(payload) != token_sha256:
                     raise ValueError("ScoutRank token payload checksum mismatch")
                 token_ids = decode_token_ids(payload, token_count)
+                if protocol_version == SCOUT_PROTOCOL_VERSION:
+                    score_start = 0
+                    full_token_count = token_count
+                    score_context = token_sha256
+                else:
+                    score_start = int(request_header.get("score_start", -1))
+                    full_token_count = int(
+                        request_header.get("full_token_count", -1)
+                    )
+                    score_end = score_start + token_count
+                    declared_score_end = int(
+                        request_header.get("score_end", -1)
+                    )
+                    if (
+                        declared_score_end != score_end
+                        or not 0 <= score_start <= score_end <= full_token_count
+                    ):
+                        raise ValueError("invalid ScoutRank suffix score range")
+                    score_context = str(
+                        request_header.get("score_context_sha256", "")
+                    )
+                    if score_context != score_context_sha256(
+                        token_sha256, score_start, full_token_count
+                    ):
+                        raise ValueError(
+                            "ScoutRank score context checksum mismatch"
+                        )
                 return self.scout_service.submit(
-                    key, token_ids, token_sha256
+                    key,
+                    token_ids,
+                    token_sha256,
+                    score_start=score_start,
+                    full_token_count=full_token_count,
+                    score_context_sha256=score_context,
                 ), b""
             if payload:
                 raise ValueError("SCOUT_WAIT does not accept a payload")
             requested_timeout = float(
                 request_header.get("timeout_s", self.scout_max_wait_timeout)
             )
+            full_token_count = int(
+                request_header.get("full_token_count", token_count)
+            )
+            expected_score_start = None
+            expected_score_end = None
+            if protocol_version == SCOUT_SUFFIX_PROTOCOL_VERSION:
+                expected_score_start = int(
+                    request_header.get("score_start", -1)
+                )
+                expected_score_end = int(request_header.get("score_end", -1))
             result, timing = await self.scout_service.wait(
                 key,
-                token_count,
+                full_token_count,
                 min(requested_timeout, self.scout_max_wait_timeout),
                 deferred=bool(request_header.get("deferred", False)),
+                score_start=expected_score_start,
+                score_end=expected_score_end,
             )
             return {
-                "token_count": token_count,
+                "token_count": full_token_count,
+                "scored_token_count": len(result.scores),
+                "score_start": result.score_start,
+                "score_end": result.score_end,
+                "full_token_count": result.full_token_count,
                 "queue_time_ms": result.queue_time_ms,
                 "score_time_ms": result.score_time_ms,
                 "total_job_time_ms": result.total_time_ms,
@@ -633,6 +685,11 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--allow-scoutrank-shadow-plan",
+        action="store_true",
+        help="Allow explicitly supplied experimental ScoutRank-v3 token plans.",
+    )
+    parser.add_argument(
         "--redis-socket-timeout",
         type=float,
         default=600.0,
@@ -658,8 +715,44 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scout-anchor-layers", default="14,28")
     parser.add_argument("--scout-observer-token-chunk-size", type=int, default=4096)
     parser.add_argument("--scout-expected-layers", type=int, default=28)
+    parser.add_argument(
+        "--scout-context-policy",
+        choices=("sliding_window", "error"),
+        default="sliding_window",
+        help=(
+            "How to handle prompts longer than the Scout model context: "
+            "bounded overlapping windows or an explicit error."
+        ),
+    )
+    parser.add_argument(
+        "--scout-context-window",
+        type=int,
+        default=None,
+        help="Optional safe Scout window size; defaults to model config limit.",
+    )
+    parser.add_argument(
+        "--scout-context-left-tokens",
+        type=int,
+        default=None,
+        help="History tokens retained before each long-prompt score region.",
+    )
+    parser.add_argument(
+        "--scout-context-right-tokens",
+        type=int,
+        default=None,
+        help="Future tokens retained for probes after each score region.",
+    )
     parser.add_argument("--scout-queue-depth", type=int, default=64)
     parser.add_argument("--scout-result-ttl-s", type=float, default=600.0)
+    parser.add_argument(
+        "--scout-prompt-cache-capacity",
+        type=int,
+        default=128,
+        help=(
+            "Maximum number of completed token-prompt hash entries retained "
+            "for cross-request reuse."
+        ),
+    )
     parser.add_argument("--scout-max-wait-timeout", type=float, default=600.0)
     return parser
 
@@ -727,6 +820,7 @@ async def run_server(args: argparse.Namespace) -> None:
         require_cuda_dequant=True,
         fallback=args.fallback,
         enable_checksum=True,
+        allow_scoutrank_shadow_plan=args.allow_scoutrank_shadow_plan,
         storage_backend=args.storage_backend
         or infer_storage_backend(args.storage_url),
         storage_namespace=args.storage_namespace,
@@ -777,11 +871,16 @@ async def run_server(args: argparse.Namespace) -> None:
             anchor_layers=_parse_list(args.scout_anchor_layers, int),
             observer_token_chunk_size=args.scout_observer_token_chunk_size,
             expected_layers=args.scout_expected_layers,
+            context_policy=args.scout_context_policy,
+            context_window=args.scout_context_window,
+            context_left_tokens=args.scout_context_left_tokens,
+            context_right_tokens=args.scout_context_right_tokens,
         )
         scout_service = ScoutJobService(
             scout_runtime,
             max_pending_jobs=args.scout_queue_depth,
             result_ttl_s=args.scout_result_ttl_s,
+            max_cached_prompts=args.scout_prompt_cache_capacity,
         )
     service = MaKVRemoteServer(
         manager,

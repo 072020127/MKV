@@ -50,7 +50,9 @@ from experiments.scoutrank_transfer.metrics import kendall_tau_b, spearman
 
 
 DEFAULT_TOPK_RATIOS = (0.01, 0.05, 0.10, 0.20, 0.50)
-DEFAULT_BUCKET_RATIOS = (0.10, 0.10, 0.60, 0.20)
+# Match the current MaKV four-tier production policy: BF16/K8V4/K4V2/K2V2.
+# Historical reports retain their original ratios in the artifact itself.
+DEFAULT_BUCKET_RATIOS = (0.10, 0.20, 0.50, 0.20)
 BUCKET_NAMES = ("BF16", "K8V4", "K4V2", "K2V2")
 
 
@@ -199,24 +201,46 @@ class AttentionScoreCollector:
         token_count: int,
         aggregation: str,
         matrix_exporter: AttentionMatrixExporter | None = None,
+        valid_token_mask: torch.Tensor | None = None,
     ) -> None:
         if token_count <= 0:
             raise ValueError("token_count must be positive")
-        if aggregation not in ("incoming_mean", "incoming_sum", "last_query"):
+        if aggregation not in (
+            "incoming_mean",
+            "incoming_sum",
+            "incoming_both",
+            "future_both",
+            "last_query",
+        ):
             raise ValueError(f"unsupported attention aggregation: {aggregation}")
         self.token_count = token_count
         self.aggregation = aggregation
         self._score: torch.Tensor | None = None
+        self._raw_score: torch.Tensor | None = None
         self._layer_score: torch.Tensor | None = None
+        self._layer_visible_count: torch.Tensor | None = None
+        self._visible_count: torch.Tensor | None = None
         self._last_query_seen = False
         self.matrix_exporter = matrix_exporter
         self.layer_count = 0
+        if valid_token_mask is not None:
+            if valid_token_mask.ndim != 1 or valid_token_mask.numel() != token_count:
+                raise ValueError("valid_token_mask must have shape [token_count]")
+            self.valid_token_mask = valid_token_mask.detach().to(dtype=torch.bool)
+        else:
+            self.valid_token_mask = None
+        self.sliding_window: int | None = None
 
     def begin_layer(self) -> None:
         """Start accumulating one layer, possibly from query-sized chunks."""
         if self._layer_score is not None:
             raise RuntimeError("previous attention layer was not finalized")
         self._last_query_seen = False
+        self._layer_visible_count = None
+
+    def set_sliding_window(self, sliding_window: int | None) -> None:
+        """Record the model's local-attention window for future visibility."""
+        self.sliding_window = sliding_window
 
     def add_query_chunk(
         self, attention_weights: torch.Tensor, query_start: int
@@ -245,7 +269,36 @@ class AttentionScoreCollector:
                 self._last_query_seen = True
             return
 
-        chunk_score = weights.sum(dim=-2).mean(dim=(0, 1))
+        if self.aggregation == "future_both":
+            query_positions = torch.arange(
+                query_start, query_end, device=weights.device
+            )
+            key_positions = torch.arange(self.token_count, device=weights.device)
+            allowed = key_positions.unsqueeze(0) < query_positions.unsqueeze(1)
+            if self.sliding_window is not None:
+                allowed &= key_positions.unsqueeze(0) > (
+                    query_positions.unsqueeze(1) - self.sliding_window
+                )
+            if self.valid_token_mask is not None:
+                valid = self.valid_token_mask.to(device=weights.device)
+                allowed &= valid[query_positions].unsqueeze(1)
+                allowed &= valid.unsqueeze(0)
+            mask = allowed.view(1, 1, query_end - query_start, self.token_count)
+            chunk_score = (weights * mask).sum(dim=(0, 1, 2))
+            chunk_count = allowed.sum(dim=0, dtype=torch.int64) * weights.shape[1]
+            if self._layer_visible_count is None:
+                self._layer_visible_count = chunk_count
+            else:
+                self._layer_visible_count.add_(chunk_count)
+        else:
+            incoming = weights.sum(dim=-2)
+            if self.aggregation == "incoming_both":
+                # Preserve the historical incoming mass semantics. The new
+                # future_both branch is deliberately separate because it
+                # excludes self-query observations and counts (l,h,j) exactly.
+                chunk_score = incoming.sum(dim=(0, 1))
+            else:
+                chunk_score = incoming.mean(dim=(0, 1))
         if self._layer_score is None:
             self._layer_score = chunk_score
         else:
@@ -258,6 +311,20 @@ class AttentionScoreCollector:
         if self.aggregation == "last_query" and not self._last_query_seen:
             raise RuntimeError("attention chunks did not include the final query")
         layer_score = self._layer_score
+        raw_layer_score = layer_score
+        self._raw_score = (
+            raw_layer_score
+            if self._raw_score is None
+            else self._raw_score + raw_layer_score
+        )
+        if self.aggregation == "future_both":
+            if self._layer_visible_count is None:
+                raise RuntimeError("future attention visibility was not collected")
+            self._visible_count = (
+                self._layer_visible_count.clone()
+                if self._visible_count is None
+                else self._visible_count + self._layer_visible_count
+            )
         if self.aggregation == "incoming_mean":
             visible_queries = torch.arange(
                 self.token_count,
@@ -270,7 +337,46 @@ class AttentionScoreCollector:
         self._score = layer_score if self._score is None else self._score + layer_score
         self.layer_count += 1
         self._layer_score = None
+        self._layer_visible_count = None
         self._last_query_seen = False
+
+    def result_variants(self) -> dict[str, torch.Tensor]:
+        """Return raw incoming mass and its visible-query normalization."""
+        if self._raw_score is None or self.layer_count == 0:
+            raise RuntimeError("no incoming attention layers were collected")
+        raw = self._raw_score / float(self.layer_count)
+        visible_queries = torch.arange(
+            self.token_count,
+            0,
+            -1,
+            device=raw.device,
+            dtype=raw.dtype,
+        )
+        normalized = raw / visible_queries
+        if not torch.isfinite(raw).all() or not torch.isfinite(normalized).all():
+            raise FloatingPointError("attention aggregation produced non-finite scores")
+        return {"incoming_sum": raw, "incoming_mean": normalized}
+
+    def result_future_variants(self) -> dict[str, torch.Tensor]:
+        """Return strict-future mass and exact ``(l,h,j)`` normalization."""
+        if (
+            self._raw_score is None
+            or self._visible_count is None
+            or self.layer_count == 0
+        ):
+            raise RuntimeError("no future attention observations were collected")
+        raw = self._raw_score
+        visible_count = self._visible_count
+        normalized = raw / visible_count.to(dtype=raw.dtype).clamp_min(1)
+        if not torch.isfinite(raw).all() or not torch.isfinite(normalized).all():
+            raise FloatingPointError(
+                "future attention aggregation produced non-finite scores"
+            )
+        return {
+            "A_raw": raw,
+            "A_norm": normalized,
+            "visible_count": visible_count,
+        }
 
     def add(self, attention_weights: torch.Tensor) -> None:
         """Consume one layer's ``[1, heads, query, key]`` attention tensor."""
@@ -380,19 +486,36 @@ def _install_attention_collector(
                 "attention overlap requires a prompt without past KV cache"
             )
 
-        key_for_scores = qwen3_mod.repeat_kv(key_states, self.num_key_value_groups)
         token_count = query_states.shape[2]
-        if key_for_scores.shape[2] != token_count:
+        if key_states.shape[2] != token_count:
             raise ValueError("attention overlap requires equal query and key lengths")
         collector.begin_layer()
+        collector.set_sliding_window(self.sliding_window)
+        num_heads = int(
+            getattr(self, "num_heads", self.config.num_attention_heads)
+        )
+        num_key_value_heads = int(
+            getattr(self, "num_key_value_heads", self.config.num_key_value_heads)
+        )
         try:
             for query_start in range(0, token_count, query_chunk_size):
                 query_end = min(query_start + query_chunk_size, token_count)
                 query_chunk = query_states[:, :, query_start:query_end, :]
-                logits = (
-                    torch.matmul(query_chunk, key_for_scores.transpose(2, 3))
-                    * self.scaling
+                query_grouped = query_chunk.reshape(
+                    1,
+                    num_key_value_heads,
+                    num_heads // num_key_value_heads,
+                    query_end - query_start,
+                    self.head_dim,
                 )
+                logits = torch.einsum(
+                    "bngqd,bnkd->bngqk", query_grouped, key_states
+                ).reshape(
+                    1,
+                    num_heads,
+                    query_end - query_start,
+                    token_count,
+                ) * self.scaling
                 logits = apply_score_mask(
                     logits,
                     attention_mask,
@@ -407,8 +530,10 @@ def _install_attention_collector(
                 collector.add_query_chunk(attention_weights, query_start)
                 del attention_weights, logits, query_chunk
         finally:
-            del key_for_scores
-            collector.finish_layer()
+            # Preserve the original exception if projection/setup fails before
+            # the first chunk is consumed.
+            if collector._layer_score is not None:
+                collector.finish_layer()
 
         attention_interface = qwen3_mod.ALL_ATTENTION_FUNCTIONS.get_interface(
             self.config._attn_implementation, qwen3_mod.eager_attention_forward
@@ -449,18 +574,23 @@ def collect_attention_scores(
     layer_mode: str = "last",
     matrix_output: Path | None = None,
     matrix_dtype: str = "model",
-) -> tuple[list[float], dict[str, Any]]:
+    valid_token_mask: torch.Tensor | None = None,
+) -> tuple[list[float] | dict[str, list[float]], dict[str, Any]]:
     """Run one prompt and return attention-based token scores.
 
     Args:
         model: A Qwen3 causal language model on the target device.
         input_ids: A ``[1, token_count]`` prompt tensor.
-        aggregation: ``incoming_mean``, ``incoming_sum``, or ``last_query``.
+        aggregation: ``incoming_mean``, ``incoming_sum``, ``incoming_both``,
+            ``future_both``, or ``last_query``. ``incoming_both`` returns its
+            historical mass variants; ``future_both`` returns strict-future
+            ``A_raw``, ``A_norm`` and integer ``visible_count`` variants.
         query_chunk_size: Number of queries processed by one score block.
         layer_mode: Collect only the final layer (``last``) or every layer
             (``all``).
         matrix_output: Optional raw output path for one complete layer matrix.
         matrix_dtype: Storage dtype for the matrix output or ``model``.
+        valid_token_mask: Optional boolean mask for valid query/key tokens.
 
     Returns:
         A CPU score list and collector metadata.
@@ -477,6 +607,12 @@ def collect_attention_scores(
         raise ValueError("Qwen3 base model does not expose model.layers")
     if query_chunk_size <= 0:
         raise ValueError("query_chunk_size must be positive")
+    if valid_token_mask is not None:
+        if valid_token_mask.ndim != 1 or valid_token_mask.numel() != input_ids.shape[1]:
+            raise ValueError("valid_token_mask must have shape [token_count]")
+        valid_token_mask = valid_token_mask.to(
+            device=input_ids.device, dtype=torch.bool
+        )
     layer_indices = _attention_layer_indices(len(layers), layer_mode)
     if matrix_output is not None and layer_mode != "first":
         raise ValueError("full attention matrix export requires layer_mode=first")
@@ -492,7 +628,10 @@ def collect_attention_scores(
             "tokens; load with --model-attention-implementation sdpa"
         )
     collector = AttentionScoreCollector(
-        int(input_ids.shape[1]), aggregation, matrix_exporter=matrix_exporter
+        int(input_ids.shape[1]),
+        aggregation,
+        matrix_exporter=matrix_exporter,
+        valid_token_mask=valid_token_mask,
     )
     restores = []
     for index in layer_indices:
@@ -514,7 +653,18 @@ def collect_attention_scores(
             )
         if device.type == "cuda":
             torch.cuda.synchronize(device)
-        scores = collector.result().detach().cpu().tolist()
+        if aggregation == "incoming_both":
+            scores = {
+                name: value.detach().cpu().tolist()
+                for name, value in collector.result_variants().items()
+            }
+        elif aggregation == "future_both":
+            scores = {
+                name: value.detach().cpu().tolist()
+                for name, value in collector.result_future_variants().items()
+            }
+        else:
+            scores = collector.result().detach().cpu().tolist()
         matrix_metadata = (
             matrix_exporter.finalize() if matrix_exporter is not None else None
         )
@@ -527,6 +677,53 @@ def collect_attention_scores(
             restore()
     metadata = {
         "aggregation": aggregation,
+        "score_variants": (
+            ["incoming_sum", "incoming_mean"]
+            if aggregation == "incoming_both"
+            else ["A_raw", "A_norm", "visible_count"]
+            if aggregation == "future_both"
+            else [aggregation]
+        ),
+        "raw_mass_formula": (
+            "sum_{l,h,j:t<j} a[l,h,j,t]"
+            if aggregation == "future_both"
+            else "historical incoming causal mass"
+        ),
+        "normalized_mass_formula": (
+            "A_raw / max(visible_count, 1), visible_count=#valid(l,h,j)"
+            if aggregation == "future_both"
+            else "historical incoming mass / visible_query_count"
+        ),
+        "valid_mask": (
+            [count > 0 for count in scores["visible_count"]]
+            if aggregation == "future_both"
+            else None
+        ),
+        "forced_precision_by_token": (
+            ["BF16" if count == 0 else None for count in scores["visible_count"]]
+            if aggregation == "future_both"
+            else None
+        ),
+        "reason_by_token": (
+            [
+                "NO_FUTURE_PROBE" if count == 0 else None
+                for count in scores["visible_count"]
+            ]
+            if aggregation == "future_both"
+            else None
+        ),
+        "token_status": (
+            [
+                {
+                    "valid_mask": count > 0,
+                    "forced_precision": "BF16" if count == 0 else None,
+                    "reason": "NO_FUTURE_PROBE" if count == 0 else None,
+                }
+                for count in scores["visible_count"]
+            ]
+            if aggregation == "future_both"
+            else None
+        ),
         "layer_count": collector.layer_count,
         "attention_weights_retained": False,
         "attention_implementation": "transformers_qwen3_chunked_qk_offline_collector",
@@ -581,6 +778,25 @@ def deterministic_order(scores: list[float]) -> list[int]:
     if any(not math.isfinite(score) for score in scores):
         raise ValueError("scores must be finite")
     return sorted(range(len(scores)), key=lambda index: (-scores[index], index))
+
+
+def _finite_analysis_scores(scores: list[float]) -> tuple[list[float], int]:
+    """Make a finite copy for auxiliary rank metrics.
+
+    Fast D22 uses non-finite values as a fail-closed safety signal. Those
+    values are handled as BF16 by bucket metrics, but legacy rank/correlation
+    helpers require finite inputs. Map every non-finite value to one shared
+    score above the finite maximum; stable position order remains the tie-break
+    and the raw vector is still retained in the report.
+    """
+    finite = [float(value) for value in scores if math.isfinite(float(value))]
+    maximum = max(finite, default=0.0)
+    sentinel = maximum + max(1.0, abs(maximum)) * 1e-6
+    result = [
+        float(value) if math.isfinite(float(value)) else sentinel
+        for value in scores
+    ]
+    return result, len(scores) - len(finite)
 
 
 def topk_overlap(
@@ -810,12 +1026,44 @@ def bucket_ids(scores: list[float], ratios: Iterable[float]) -> list[int]:
     return result
 
 
+def _bucket_ids_with_nonfinite_safety(
+    scores: list[float], ratios: Iterable[float]
+) -> tuple[list[int], int]:
+    """Assign buckets while applying MaKV's fail-closed BF16 safety rule.
+
+    ``bucket_ids`` deliberately remains strict because it is also used by
+    rank metrics. This companion is only for precision-bucket comparison:
+    NaN/+Inf/-Inf scores are not rankable and therefore go directly to bucket
+    zero (BF16); configured ratios are applied to the remaining finite scores.
+    """
+    ratios_tuple = _validate_ratios(ratios, "bucket_ratios")
+    result = [0] * len(scores)
+    finite_positions: list[int] = []
+    finite_scores: list[float] = []
+    forced_count = 0
+    for position, score in enumerate(scores):
+        if math.isfinite(float(score)):
+            finite_positions.append(position)
+            finite_scores.append(float(score))
+        else:
+            forced_count += 1
+    if finite_scores:
+        finite_buckets = bucket_ids(finite_scores, ratios_tuple)
+        for position, assigned in zip(finite_positions, finite_buckets, strict=True):
+            result[position] = assigned
+    return result, forced_count
+
+
 def bucket_agreement(
     scout_scores: list[float], attention_scores: list[float], ratios: Iterable[float]
 ) -> dict[str, Any]:
     """Compare current four-tier rank assignments and return a confusion matrix."""
-    left = bucket_ids(scout_scores, ratios)
-    right = bucket_ids(attention_scores, ratios)
+    left, scout_nonfinite_count = _bucket_ids_with_nonfinite_safety(
+        scout_scores, ratios
+    )
+    right, attention_nonfinite_count = _bucket_ids_with_nonfinite_safety(
+        attention_scores, ratios
+    )
     matrix = {name: {other: 0 for other in BUCKET_NAMES} for name in BUCKET_NAMES}
     for scout_bucket, attention_bucket in zip(left, right, strict=True):
         matrix[BUCKET_NAMES[scout_bucket]][BUCKET_NAMES[attention_bucket]] += 1
@@ -846,7 +1094,99 @@ def bucket_agreement(
         "weighted_bucket_agreement": weighted,
         "cohen_kappa": kappa,
         "scout_to_attention_confusion": matrix,
+        "nonfinite_forced_to_bf16": {
+            "scoutrank": scout_nonfinite_count,
+            "attention": attention_nonfinite_count,
+        },
     }
+
+
+def bucket_token_id_overlap(
+    scout_scores: list[float],
+    attention_scores: list[float],
+    token_ids: list[int],
+    ratios: Iterable[float],
+) -> dict[str, Any]:
+    """Compare token-ID sets assigned to the same precision bucket.
+
+    This intentionally ignores order within a bucket.  A repeated token ID is
+    counted once per prompt and bucket, which answers whether both scorers put
+    the same vocabulary token in that precision tier rather than whether they
+    chose the same occurrence position.  Position/occurrence counts are kept
+    as diagnostics because repeated IDs are common in long prompts.
+    """
+    if len(scout_scores) != len(attention_scores):
+        raise ValueError("score vectors must have equal length")
+    if len(token_ids) != len(scout_scores) or not token_ids:
+        raise ValueError("token_ids must match non-empty score vectors")
+    ratios_tuple = _validate_ratios(ratios, "bucket_ratios")
+    if len(ratios_tuple) != len(BUCKET_NAMES):
+        raise ValueError(
+            f"bucket_token_id_overlap requires {len(BUCKET_NAMES)} bucket ratios"
+        )
+
+    scout_bucket_ids, scout_nonfinite_count = _bucket_ids_with_nonfinite_safety(
+        scout_scores, ratios_tuple
+    )
+    attention_bucket_ids, attention_nonfinite_count = (
+        _bucket_ids_with_nonfinite_safety(attention_scores, ratios_tuple)
+    )
+    result: dict[str, Any] = {
+        "unit": "unique_token_id_set",
+        "order_sensitive": False,
+        "duplicate_token_ids_collapsed": True,
+        "nonfinite_forced_to_bf16": {
+            "scoutrank": scout_nonfinite_count,
+            "attention": attention_nonfinite_count,
+        },
+        "bucket_names": list(BUCKET_NAMES),
+        "buckets": {},
+    }
+    for bucket_index, bucket_name in enumerate(BUCKET_NAMES):
+        scout_positions = {
+            index
+            for index, assigned in enumerate(scout_bucket_ids)
+            if assigned == bucket_index
+        }
+        attention_positions = {
+            index
+            for index, assigned in enumerate(attention_bucket_ids)
+            if assigned == bucket_index
+        }
+        scout_token_set = {int(token_ids[index]) for index in scout_positions}
+        attention_token_set = {
+            int(token_ids[index]) for index in attention_positions
+        }
+        common = scout_token_set & attention_token_set
+        union = scout_token_set | attention_token_set
+        position_intersection = scout_positions & attention_positions
+        result["buckets"][bucket_name] = {
+            "scoutrank_position_count": len(scout_positions),
+            "attention_position_count": len(attention_positions),
+            "scoutrank_unique_token_id_count": len(scout_token_set),
+            "attention_unique_token_id_count": len(attention_token_set),
+            "same_unique_token_id_count": len(common),
+            # The symmetric overlap rate is Jaccard.  Directional values are
+            # included because bucket cardinalities can differ after ties or
+            # safety handling in future callers.
+            "overlap_rate": len(common) / len(union) if union else 1.0,
+            "jaccard": len(common) / len(union) if union else 1.0,
+            "scoutrank_bucket_recall": (
+                len(common) / len(scout_token_set) if scout_token_set else 1.0
+            ),
+            "attention_bucket_recall": (
+                len(common) / len(attention_token_set)
+                if attention_token_set
+                else 1.0
+            ),
+            "same_position_count": len(position_intersection),
+            "same_position_fraction": (
+                len(position_intersection) / len(scout_positions | attention_positions)
+                if scout_positions | attention_positions
+                else 1.0
+            ),
+        }
+    return result
 
 
 def block_scores(scores: list[float], block_size: int) -> list[float]:
@@ -864,6 +1204,7 @@ def _top_preview(
 ) -> list[dict[str, Any]]:
     """Return a compact human-readable top-token preview."""
     tokens = tokenizer.convert_ids_to_tokens(token_ids)
+    analysis_scores, _ = _finite_analysis_scores(scores)
     return [
         {
             "position": position,
@@ -871,7 +1212,7 @@ def _top_preview(
             "token": tokens[position],
             "score": scores[position],
         }
-        for position in deterministic_order(scores)[:count]
+        for position in deterministic_order(analysis_scores)[:count]
     ]
 
 
@@ -998,6 +1339,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         observer_token_chunk_size=args.observer_token_chunk_size,
         anchor_layers=anchor_layers,
         exit_layer=args.exit_layer,
+        scoring_version=args.scoring_version,
     )
     topk_ratios = _parse_float_list(args.topk_ratios, "topk_ratios")
     bucket_ratios = _validate_ratios(
@@ -1011,7 +1353,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             _sync(device)
             started = time.perf_counter()
             scout_scores = _score_prompt(
-                ids, device=device, adapter=adapter, scorer=scorer
+                ids,
+                device=device,
+                adapter=adapter,
+                scorer=scorer,
+                scoring_version=args.scoring_version,
             )
             _sync(device)
             scout_ms = (time.perf_counter() - started) * 1000.0
@@ -1030,12 +1376,44 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 ),
                 matrix_dtype=args.attention_matrix_dtype,
             )
+            if isinstance(attention_scores, dict):
+                if args.attention_aggregation != "future_both":
+                    raise RuntimeError(
+                        "attention score variants are only expected for future_both"
+                    )
+                attention_variants = attention_scores
+                attention_scores = [
+                    float(value) for value in attention_variants["A_norm"]
+                ]
+                attention_meta = {
+                    **attention_meta,
+                    "scoring_version": "v3.2_attention_normalized",
+                    "selected_variant": "A_norm",
+                    "A_raw": [
+                        float(value) for value in attention_variants["A_raw"]
+                    ],
+                    "A_norm": attention_scores,
+                    "visible_count": [
+                        int(value)
+                        for value in attention_variants["visible_count"]
+                    ],
+                }
             _sync(device)
             attention_ms = (time.perf_counter() - started) * 1000.0
             if len(scout_scores) != len(attention_scores):
                 raise RuntimeError("ScoutRank and attention score lengths differ")
-            block_scout_scores = block_scores(scout_scores, args.block_size)
-            block_attention_scores = block_scores(attention_scores, args.block_size)
+            scout_analysis_scores, scout_nonfinite_count = _finite_analysis_scores(
+                scout_scores
+            )
+            attention_analysis_scores, attention_nonfinite_count = (
+                _finite_analysis_scores(attention_scores)
+            )
+            block_scout_scores = block_scores(
+                scout_analysis_scores, args.block_size
+            )
+            block_attention_scores = block_scores(
+                attention_analysis_scores, args.block_size
+            )
             row = {
                 "prompt_id": prompt.prompt_id,
                 "source": prompt.source,
@@ -1055,21 +1433,36 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "scoutrank_forward_and_score": scout_ms,
                     "attention_forward_and_aggregate": attention_ms,
                 },
-                "ranking": ranking_metrics(scout_scores, attention_scores),
+                "analysis_score_nonfinite_count": {
+                    "scoutrank": scout_nonfinite_count,
+                    "attention": attention_nonfinite_count,
+                },
+                "ranking": ranking_metrics(
+                    scout_analysis_scores, attention_analysis_scores
+                ),
                 "score_similarity": score_similarity_metrics(
-                    scout_scores, attention_scores
+                    scout_analysis_scores, attention_analysis_scores
                 ),
                 "ranking_similarity": {
                     "symmetric_ndcg": symmetric_ndcg(
-                        scout_scores, attention_scores, topk_ratios
+                        scout_analysis_scores,
+                        attention_analysis_scores,
+                        topk_ratios,
                     ),
                     "rbo_p09": rank_biased_overlap(
-                        scout_scores, attention_scores, persistence=0.9
+                        scout_analysis_scores,
+                        attention_analysis_scores,
+                        persistence=0.9,
                     ),
                 },
-                "topk": topk_overlap(scout_scores, attention_scores, topk_ratios),
+                "topk": topk_overlap(
+                    scout_analysis_scores, attention_analysis_scores, topk_ratios
+                ),
                 "bucket_agreement": bucket_agreement(
                     scout_scores, attention_scores, bucket_ratios
+                ),
+                "bucket_token_id_overlap": bucket_token_id_overlap(
+                    scout_scores, attention_scores, ids, bucket_ratios
                 ),
                 "block_32": {
                     "scoutrank_scores": block_scout_scores,
@@ -1134,6 +1527,27 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             rows, ("bucket_agreement", "weighted_bucket_agreement")
         ),
         "cohen_kappa_mean": _mean_metric(rows, ("bucket_agreement", "cohen_kappa")),
+        "bucket_token_id_overlap_mean": {
+            bucket_name: {
+                metric: _mean_metric(
+                    rows,
+                    (
+                        "bucket_token_id_overlap",
+                        "buckets",
+                        bucket_name,
+                        metric,
+                    ),
+                )
+                for metric in (
+                    "overlap_rate",
+                    "jaccard",
+                    "scoutrank_bucket_recall",
+                    "attention_bucket_recall",
+                    "same_position_fraction",
+                )
+            }
+            for bucket_name in BUCKET_NAMES
+        },
         "score_similarity_mean": {
             metric: _mean_metric(rows, ("score_similarity", metric))
             for metric in (
@@ -1196,7 +1610,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "schema_version": 2,
         "method": {
-            "scoutrank": "existing ScoutRank damage_22 token importance",
+            "scoutrank": f"ScoutRank {args.scoring_version} token importance",
             "attention": (
                 "same Qwen3 scout model, chunked QK-softmax attention, "
                 f"{args.attention_layer_mode} layer, "
@@ -1205,12 +1619,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "same_token_sequence": True,
             "attention_weights_retained": False,
             "production_policy_modified": False,
+            "bucket_token_id_metric": (
+                "per-bucket unique token-ID set overlap; order within a bucket is ignored"
+            ),
+            "nonfinite_analysis_policy": (
+                "non-finite safety scores stay raw and are forced to BF16 for bucket "
+                "metrics; auxiliary rank metrics use a deterministic finite sentinel"
+            ),
         },
         "model": args.model,
         "tokenizer": args.tokenizer or args.model,
         "device": str(device),
         "dtype": args.dtype,
         "scoring_mode": args.mode,
+        "scoring_version": args.scoring_version,
         "observer_backend": args.observer_backend,
         "anchor_layers": list(anchor_layers),
         "exit_layer": args.exit_layer,
@@ -1246,6 +1668,23 @@ def main() -> None:
     )
     parser.add_argument("--mode", choices=("fast", "balanced"), default="balanced")
     parser.add_argument(
+        "--scoring-version",
+        choices=(
+            "v2",
+            "v3-functional-disturbance",
+            "v3.1-projected",
+            "v3.1-probe-normalized",
+            "v3_fast_d22",
+            "v3_fast_1_exact_scalar_d22",
+        ),
+        default=os.getenv("SCOUT_SCORING_VERSION", "v2"),
+        help=(
+            "ScoutRank implementation used for the comparison. The default "
+            "v2 preserves the historical offline experiment; use "
+            "v3_fast_1_exact_scalar_d22 to validate the current fast scorer."
+        ),
+    )
+    parser.add_argument(
         "--observer-backend", choices=("vectorized", "production"), default="vectorized"
     )
     parser.add_argument("--observer-token-chunk-size", type=int, default=4096)
@@ -1253,7 +1692,7 @@ def main() -> None:
     parser.add_argument("--exit-layer", type=int, default=None)
     parser.add_argument(
         "--attention-aggregation",
-        choices=("incoming_mean", "incoming_sum", "last_query"),
+        choices=("incoming_mean", "incoming_sum", "future_both", "last_query"),
         default="incoming_mean",
     )
     parser.add_argument(

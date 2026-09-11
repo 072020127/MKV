@@ -3,6 +3,7 @@
 """Reference MaKV remote quantizer."""
 
 # Standard
+from dataclasses import dataclass
 from typing import Any
 
 # Third Party
@@ -25,6 +26,22 @@ from lmcache.v1.storage_backend.makv.residual import (
 QUANTIZER_VERSION = "makv_per_token_head_symmetric_narrow_v1"
 
 
+@dataclass(frozen=True)
+class VectorFakeQuantization:
+    """One production-semantic per-vector quantize/dequantize result.
+
+    ``quantized`` retains the unpacked signed integer values so callers that
+    only need a reconstructed vector do not need to materialize a serialized
+    low-bit payload. ``stored_scale`` is the scale after the exact on-wire
+    dtype cast; reconstruction deliberately uses this value rather than the
+    higher-precision temporary scale.
+    """
+
+    quantized: torch.Tensor
+    stored_scale: torch.Tensor
+    reconstructed: torch.Tensor
+
+
 def _scale_dtype(scale_dtype: str) -> torch.dtype:
     return torch.float16 if scale_dtype == "float16" else torch.float32
 
@@ -34,23 +51,99 @@ def _tensor_bytes(tensor: torch.Tensor) -> bytes:
     return tensor.contiguous().cpu().view(torch.uint8).numpy().tobytes()
 
 
+def fake_quantize_dequantize_vectors(
+    vectors: torch.Tensor,
+    bits: int,
+    scale_dtype: str,
+) -> VectorFakeQuantization:
+    """Apply MaKV's production per-token/head quantization arithmetic.
+
+    Args:
+        vectors: Tensor whose final dimension is one KV head vector.
+        bits: Physical MaKV width, one of 2, 4, 8, or 16.
+        scale_dtype: Serialized scale dtype (``float16`` or ``float32``).
+
+    Returns:
+        The unpacked signed integers, serialized-scale tensor, and restored
+        vectors cast back to ``vectors.dtype``.
+
+    Notes:
+        The remote serializer calls this same core before low-bit packing.
+        Packing is a lossless transport of ``quantized`` and does not alter
+        the fake-quant reconstruction.
+    """
+    if vectors.ndim < 1 or vectors.shape[-1] <= 0:
+        raise ValueError("vectors must have a non-empty final head dimension")
+    stored_dtype = _scale_dtype(scale_dtype)
+    if bits == 16:
+        return VectorFakeQuantization(
+            quantized=vectors,
+            stored_scale=torch.empty(0, dtype=stored_dtype, device=vectors.device),
+            reconstructed=vectors,
+        )
+    if bits not in (2, 4, 8):
+        raise ValueError(f"Unsupported MaKV quantization width: {bits}")
+    qmax = {2: 1, 4: 7, 8: 127}[bits]
+    max_abs = vectors.abs().amax(dim=-1)
+    temporary_scale = torch.where(
+        max_abs == 0, torch.ones_like(max_abs), max_abs / qmax
+    )
+    quantized = (
+        torch.round(vectors / temporary_scale.unsqueeze(-1))
+        .clamp(-qmax, qmax)
+        .to(torch.int8)
+    )
+    stored_scale = temporary_scale.to(stored_dtype)
+    reconstructed = (
+        quantized.to(torch.float32) * stored_scale.to(torch.float32).unsqueeze(-1)
+    ).to(vectors.dtype)
+    return VectorFakeQuantization(
+        quantized=quantized,
+        stored_scale=stored_scale,
+        reconstructed=reconstructed,
+    )
+
+
+def per_token_head_storage_bytes(
+    bits: int,
+    head_dim: int,
+    scale_dtype: str,
+    *,
+    raw_dtype_bytes: int = 2,
+) -> int:
+    """Return exact variable payload bytes for one MaKV token/head vector.
+
+    The calculation mirrors the row-local packing in
+    ``_quantize_vector_bucket``. It excludes object framing and positions;
+    callers that build a whole token plan can add the fixed int32 position
+    entry for each K/V plane separately.
+    """
+    if head_dim <= 0:
+        raise ValueError("head_dim must be positive")
+    if raw_dtype_bytes <= 0:
+        raise ValueError("raw_dtype_bytes must be positive")
+    if bits == 16:
+        return head_dim * raw_dtype_bytes
+    if bits not in (2, 4, 8):
+        raise ValueError(f"Unsupported MaKV quantization width: {bits}")
+    values_per_byte = 8 // bits
+    payload = (head_dim + values_per_byte - 1) // values_per_byte
+    return payload + torch.empty((), dtype=_scale_dtype(scale_dtype)).element_size()
+
+
 def _quantize_vector_bucket(
     vectors: torch.Tensor,
     bits: int,
     scale_dtype: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    fake = fake_quantize_dequantize_vectors(vectors, bits, scale_dtype)
     if bits == 16:
-        return vectors, torch.empty(0, dtype=_scale_dtype(scale_dtype))
-    if bits not in (2, 4, 8):
-        raise ValueError(f"Unsupported MaKV quantization width: {bits}")
-    qmax = {2: 1, 4: 7, 8: 127}[bits]
-    max_abs = vectors.abs().amax(dim=-1)
-    scale = torch.where(max_abs == 0, torch.ones_like(max_abs), max_abs / qmax)
-    q = torch.round(vectors / scale.unsqueeze(-1)).clamp(-qmax, qmax)
+        return vectors, fake.stored_scale
+    q = fake.quantized
     if bits == 8:
-        return q.to(torch.int8), scale.to(_scale_dtype(scale_dtype))
+        return q, fake.stored_scale
     # Low-bit values use two's-complement fields packed within each row.
-    q_int = q.to(torch.int8)
+    q_int = q
     flat = q_int.reshape(-1, q_int.shape[-1])
     values_per_byte = 8 // bits
     field_mask = (1 << bits) - 1
@@ -61,8 +154,9 @@ def _quantize_vector_bucket(
         flat.shape[0], -1, values_per_byte
     )
     shifts = torch.arange(values_per_byte, dtype=torch.int16) * bits
+    shifts = shifts.to(device=flat.device)
     packed_tensor = torch.sum(fields << shifts, dim=-1).to(torch.uint8).flatten()
-    return packed_tensor, scale.to(_scale_dtype(scale_dtype))
+    return packed_tensor, fake.stored_scale
 
 
 def quantize_canonical_kv(
@@ -175,7 +269,9 @@ def quantize_canonical_kv(
                     {"bits": bit, "count": 0, "layout": "token"}
                 )
                 continue
-            vectors = kv_tensor[:, :, token_positions.long(), :, :]
+            vectors = kv_tensor[
+                :, :, token_positions.to(device=kv_tensor.device).long(), :, :
+            ]
             q_payload, scales = _quantize_vector_bucket(
                 vectors, bit, config.scale_dtype
             )
@@ -224,7 +320,14 @@ def quantize_canonical_kv(
                     {"bits": bit, "count": 0, "layout": "layer_kv_token"}
                 )
                 continue
-            gathered = kv_tensor[indices[:, 0], indices[:, 1], indices[:, 2], :, :]
+            indices_device = indices.to(device=kv_tensor.device)
+            gathered = kv_tensor[
+                indices_device[:, 0],
+                indices_device[:, 1],
+                indices_device[:, 2],
+                :,
+                :,
+            ]
             q_payload, scales = _quantize_vector_bucket(
                 gathered, bit, config.scale_dtype
             )

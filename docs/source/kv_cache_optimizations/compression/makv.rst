@@ -92,8 +92,9 @@ defaults are unchanged. Ratio sweeps can use
 Architecture
 ------------
 
-MaKV keeps client-side PUT unquantized. The client computes a deterministic
-``MaKVQuantPlan`` from prompt-token importance and uploads:
+MaKV uses a single PUT compression location: the independent Remote Manager.
+The client computes a deterministic ``MaKVQuantPlan`` from prompt-token
+importance and uploads:
 
 - raw FP16/BF16 KV bytes
 - plan metadata
@@ -113,6 +114,14 @@ client or change the LMCache ``makv://`` network protocol.
 
 GET returns the stored ``MaKVObject`` bytes without remote dequantization. The
 client deserializer keeps the payload compressed until restore time.
+
+The sender never quantizes or entropy-codes the KV payload. The manager performs
+the configured quantization, optional CacheGen arithmetic coding, and optional
+residual generation before atomically storing the object. Set
+``makv_residual_dtype`` to ``float16`` or ``float32`` when a later risk-guided
+precision upgrade is required. ``none`` deliberately disables that upgrade
+path. Missing importance uses the configured explicit ``naive`` fallback; it
+never silently turns all tokens into INT4.
 
 Importance formats
 ------------------
@@ -315,8 +324,8 @@ The corresponding manager command is:
      --entropy-backend cuda \
      --entropy-require-cuda
 
-Only the remote manager calls the arithmetic encoder during PUT. The client
-still uploads raw FP16/BF16 KV and its plan. The encoder uses the existing
+The remote manager calls the arithmetic encoder during PUT and the client still
+uploads raw FP16/BF16 KV and its plan. The encoder uses the existing
 ``calculate_cdf``/``encode_fast_new`` CacheGen CUDA APIs, splitting each
 quantized stream into bounded 256-symbol streams. INT8 is represented by two
 small symbol planes; INT4 and INT2 use one plane. CDFs, stream lengths, and
@@ -544,7 +553,8 @@ Current MaKV metrics include:
   ``makv_client_raw_payload_copy_time_ms``,
   ``makv_client_envelope_encode_time_ms``,
   ``makv_client_serialize_total_time_ms``, ``makv_put_raw_bytes``,
-  ``makv_put_plan_bytes``, and ``makv_client_quantize_calls``
+  ``makv_put_plan_bytes``, and ``makv_client_quantize_calls``. The last metric
+  must remain zero because PUT quantization is manager-side.
 - remote: ``makv_remote_quantize_time_ms``, ``makv_raw_input_bytes``,
   ``makv_stored_bytes`` and HEALTH ``compression_ratio``,
   ``makv_quantize_failures``, ``makv_naive_fallbacks``,

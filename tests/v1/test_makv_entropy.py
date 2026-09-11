@@ -411,7 +411,15 @@ def test_independent_manager_entropy_network_path(tmp_path):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA runtime unavailable")
 def test_cuda_cachegen_arithmetic_round_trip():
-    c_ops = importlib.import_module("lmcache.c_ops")
+    c_ops = None
+    for module_name in ("lmcache.cuda_ops", "lmcache.c_ops"):
+        try:
+            c_ops = importlib.import_module(module_name)
+        except (ImportError, OSError):
+            continue
+        break
+    if c_ops is None:
+        pytest.skip("CacheGen CUDA extension is unavailable")
     if not all(
         hasattr(c_ops, name)
         for name in ("calculate_cdf", "encode_fast_new", "decode_fast_prefsum")

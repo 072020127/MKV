@@ -57,17 +57,22 @@ def _tensor_bytes(tensor: torch.Tensor) -> bytes:
 
 
 def _cuda_codec_module() -> Any | None:
-    """Return the existing CacheGen extension when it exposes AC kernels."""
-    try:
-        module = importlib.import_module("lmcache.c_ops")
-    except (ImportError, OSError):
-        return None
-    if not all(
-        hasattr(module, name)
-        for name in ("calculate_cdf", "encode_fast_new", "decode_fast_prefsum")
-    ):
-        return None
-    return module
+    """Return the formal CacheGen extension when it exposes AC kernels.
+
+    ``cuda_ops`` is the current wheel/build target. ``c_ops`` is retained as
+    a compatibility fallback for installations produced by older LMCache
+    commits, but a stale extension must not prevent the current module from
+    being selected.
+    """
+    required = ("calculate_cdf", "encode_fast_new", "decode_fast_prefsum")
+    for module_name in ("lmcache.cuda_ops", "lmcache.c_ops"):
+        try:
+            module = importlib.import_module(module_name)
+        except (ImportError, OSError):
+            continue
+        if all(hasattr(module, name) for name in required):
+            return module
+    return None
 
 
 def _select_backend(backend: str, require_cuda: bool) -> tuple[str, Any | None]:
