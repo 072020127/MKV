@@ -42,3 +42,38 @@ def finish_makv_restore_timing_scope(scope_id: int) -> dict[str, Any]:
     """Return a completed scope as plain data for cache-engine reporting."""
     module = importlib.import_module("lmcache.v1.storage_backend.makv.metrics")
     return module.RESTORE_METRICS.finish_restore_scope(scope_id).__dict__.copy()
+
+
+def record_makv_stream_restore_submission(scope_id: int, memory_obj: Any) -> None:
+    """Record an already validated streamed object entering GPU restore."""
+    module = importlib.import_module("lmcache.v1.storage_backend.makv.metrics")
+    restore_ready_ns = getattr(memory_obj, "makv_restore_ready_ns", None)
+    if isinstance(restore_ready_ns, int):
+        module.RESTORE_METRICS.record_stream_restore_submission(
+            scope_id,
+            restore_ready_ns=restore_ready_ns,
+        )
+
+
+def handoff_makv_restore_ready_event(load_stream: Any, scope_id: int) -> Any:
+    """Make the caller's current CUDA stream wait for restore completion.
+
+    The synchronous cache-engine API has no event return type. This handoff is
+    therefore opt-in: it replaces a host-side load-stream synchronize only
+    when the caller will submit subsequent model work on its current stream.
+    """
+    import torch
+
+    device = load_stream.device
+    with torch.cuda.device(device):
+        event = torch.cuda.Event()
+        event.record(load_stream)
+        consumer_stream = torch.cuda.current_stream(device)
+        if consumer_stream.cuda_stream != load_stream.cuda_stream:
+            consumer_stream.wait_event(event)
+    module = importlib.import_module("lmcache.v1.storage_backend.makv.metrics")
+    module.RESTORE_METRICS.add_restore(
+        scope_id,
+        makv_restore_ready_event_handoffs=1,
+    )
+    return event

@@ -341,6 +341,7 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
 
         self.store_stream = torch.cuda.Stream()
         self.load_stream = torch.cuda.Stream()
+        self._makv_h2d_streams: dict[int | None, torch.cuda.Stream] = {}
 
     @classmethod
     def from_metadata(
@@ -409,6 +410,15 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
         )
 
         return self.kv_cache_pointers_on_gpu[idx]
+
+    def _get_makv_h2d_stream(self) -> torch.cuda.Stream:
+        """Return one dedicated copy stream per active CUDA device."""
+        device_index = self.device.index
+        stream = self._makv_h2d_streams.get(device_index)
+        if stream is None:
+            stream = torch.cuda.Stream(device=self.device)
+            self._makv_h2d_streams[device_index] = stream
+        return stream
 
     @_lmcache_nvtx_annotate
     def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
@@ -488,6 +498,10 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
                 skip_prefix_n_tokens=skip_prefix_n_tokens,
                 require_cuda=bool(kwargs.get("makv_require_cuda_dequant", True)),
                 timing_scope=kwargs.get("makv_timing_scope"),
+                h2d_stream=self._get_makv_h2d_stream(),
+                max_inflight_tickets=kwargs.get(
+                    "makv_max_inflight_restore_tickets"
+                ),
             )
             return
 
@@ -705,6 +719,7 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
 
         self.store_stream = torch.cuda.Stream()
         self.load_stream = torch.cuda.Stream()
+        self.makv_h2d_stream = torch.cuda.Stream(device=device)
 
     @classmethod
     def from_metadata(
@@ -852,6 +867,10 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
                 skip_prefix_n_tokens=skip_prefix_n_tokens,
                 require_cuda=bool(kwargs.get("makv_require_cuda_dequant", True)),
                 timing_scope=kwargs.get("makv_timing_scope"),
+                h2d_stream=self.makv_h2d_stream,
+                max_inflight_tickets=kwargs.get(
+                    "makv_max_inflight_restore_tickets"
+                ),
             )
             return
 

@@ -2,6 +2,7 @@
 
 # Standard
 import asyncio
+import gc
 import hashlib
 import json
 import socket
@@ -9,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+import weakref
 
 # Third Party
 import pytest
@@ -36,6 +38,7 @@ from lmcache.v1.storage_backend.makv.format import (
 from lmcache.v1.storage_backend.makv.gpu_restore import restore_makv_quantized_to_tensor
 from lmcache.v1.storage_backend.makv.metrics import (
     CLIENT_METRICS,
+    MaKVMetrics,
     REMOTE_METRICS,
     RESTORE_METRICS,
 )
@@ -46,11 +49,15 @@ from lmcache.v1.storage_backend.makv.plan import (
 )
 from lmcache.v1.storage_backend.makv.serde import MaKVDeserializer, MaKVSerializer
 from lmcache.v1.storage_backend.makv_remote.manager import MaKVRemoteManager
-from lmcache.v1.storage_backend.makv_remote.server import MaKVRemoteServer
+from lmcache.v1.storage_backend.makv_remote.server import (
+    MaKVRemoteServer,
+    build_parser as build_makv_remote_parser,
+)
 from lmcache.v1.storage_backend.makv_remote.protocol import (
     BATCH_BLOB_ENTRY,
     BATCH_BLOB_HEADER,
     BATCH_BLOB_VERSION,
+    BATCH_STREAM_VERSION,
     FRAME_HEADER,
     decode_batch_blob,
     decode_batch_blob_directory,
@@ -110,6 +117,36 @@ def _make_config(
         remote_serde="makv",
         extra_config=extra_config,
     )
+
+
+def test_live_scout_defaults_to_fast_mix_without_changing_v3_defaults():
+    """The manager defaults are explicit and do not mutate ScoutRankConfig."""
+    args = build_makv_remote_parser().parse_args([])
+
+    assert args.scout_scoring_version == "v3_fast_1_exact_scalar_d22"
+    assert args.scout_v3_num_probes == 32
+    assert args.scout_v3_tail_probes == 16
+    assert args.scout_v3_probe_selection == "mix32"
+
+
+def test_live_scout_cli_allows_an_explicit_legacy_override():
+    args = build_makv_remote_parser().parse_args(
+        [
+            "--scout-scoring-version",
+            "v2",
+            "--scout-v3-num-probes",
+            "16",
+            "--scout-v3-tail-probes",
+            "8",
+            "--scout-v3-probe-selection",
+            "priority",
+        ]
+    )
+
+    assert args.scout_scoring_version == "v2"
+    assert args.scout_v3_num_probes == 16
+    assert args.scout_v3_tail_probes == 8
+    assert args.scout_v3_probe_selection == "priority"
 
 
 @pytest.fixture
@@ -951,6 +988,257 @@ def test_makv_network_stream_yields_before_later_mkvb_payload(tmp_path, small_me
         close_asyncio_loop(loop, thread)
 
 
+def test_makv_stream_receive_prefetch_is_bounded(tmp_path, small_metadata):
+    """A slow restore consumer bounds receive-ahead and records backpressure."""
+    loop, thread = init_asyncio_loop()
+    server = None
+    try:
+        payloads = [b"object-0", b"object-1", b"object-2", b"object-3"]
+
+        async def handler(reader, writer) -> None:
+            await read_frame(reader)
+            for index, payload in enumerate(payloads):
+                header = json.dumps(
+                    {
+                        "status": "ok",
+                        "index": index,
+                        "count": len(payloads),
+                        "batch_stream_version": BATCH_STREAM_VERSION,
+                        "found": True,
+                        "checksum_verified": True,
+                    },
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                writer.write(FRAME_HEADER.pack(len(header), len(payload)))
+                writer.write(header)
+                writer.write(payload)
+                await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        async def start_server():
+            result = await asyncio.start_server(handler, "127.0.0.1", 0)
+            port = int(result.sockets[0].getsockname()[1])
+            return result, port
+
+        server, port = asyncio.run_coroutine_threadsafe(start_server(), loop).result()
+        config = _make_config(
+            tmp_path,
+            remote_url=f"makv://127.0.0.1:{port}",
+            makv_stream_receive_prefetch_depth=2,
+        )
+        connector = MaKVNetworkConnector(
+            config.remote_url, loop, None, config, small_metadata
+        )
+
+        async def collect_slowly() -> list[bytes]:
+            values: list[bytes] = []
+            async for index, value in connector.batched_get_streaming(
+                [dumb_cache_engine_key(index) for index in range(len(payloads))]
+            ):
+                assert value is not None
+                values.append(bytes(value.byte_array))
+                if index == 0:
+                    await asyncio.sleep(0.1)
+            return values
+
+        values = asyncio.run_coroutine_threadsafe(collect_slowly(), loop).result()
+        metrics = CLIENT_METRICS.snapshot()
+        assert values == payloads
+        assert metrics.makv_client_get_stream_prefetch_peak == 2
+        assert metrics.makv_client_get_stream_prefetch_backpressure_waits >= 1
+    finally:
+        if server is not None:
+            async def stop_server() -> None:
+                server.close()
+                await server.wait_closed()
+
+            asyncio.run_coroutine_threadsafe(stop_server(), loop).result()
+        close_asyncio_loop(loop, thread)
+
+
+def test_makv_stream_receive_prefetch_cancels_on_consumer_close(
+    tmp_path, small_metadata
+):
+    """Closing the consumer cancels the receiver blocked on the next frame."""
+    loop, thread = init_asyncio_loop()
+    server = None
+    disconnected = asyncio.Event()
+    try:
+        async def handler(reader, writer) -> None:
+            await read_frame(reader)
+            payload = b"first-object"
+            header = json.dumps(
+                {
+                    "status": "ok",
+                    "index": 0,
+                    "count": 2,
+                    "batch_stream_version": BATCH_STREAM_VERSION,
+                    "found": True,
+                    "checksum_verified": True,
+                },
+                separators=(",", ":"),
+            ).encode("utf-8")
+            writer.write(FRAME_HEADER.pack(len(header), len(payload)))
+            writer.write(header)
+            writer.write(payload)
+            await writer.drain()
+            await reader.read()
+            disconnected.set()
+            writer.close()
+            await writer.wait_closed()
+
+        async def start_server():
+            result = await asyncio.start_server(handler, "127.0.0.1", 0)
+            port = int(result.sockets[0].getsockname()[1])
+            return result, port
+
+        server, port = asyncio.run_coroutine_threadsafe(start_server(), loop).result()
+        config = _make_config(tmp_path, remote_url=f"makv://127.0.0.1:{port}")
+        connector = MaKVNetworkConnector(
+            config.remote_url, loop, None, config, small_metadata
+        )
+
+        async def receive_then_close() -> None:
+            stream = connector.batched_get_streaming(
+                [dumb_cache_engine_key(1), dumb_cache_engine_key(2)]
+            )
+            index, value = await anext(stream)
+            assert index == 0
+            assert value is not None
+            await stream.aclose()
+            await asyncio.wait_for(disconnected.wait(), 1.0)
+
+        asyncio.run_coroutine_threadsafe(receive_then_close(), loop).result()
+    finally:
+        if server is not None:
+            async def stop_server() -> None:
+                server.close()
+                await server.wait_closed()
+
+            asyncio.run_coroutine_threadsafe(stop_server(), loop).result()
+        close_asyncio_loop(loop, thread)
+
+
+def test_makv_network_stream_rejects_truncated_object_before_yield():
+    """A partial frame must never become a restore candidate."""
+    payload = b"incomplete-makv-object"
+
+    class TruncatedSocketLoop:
+        def __init__(self) -> None:
+            self._remaining = memoryview(payload)
+
+        async def sock_recv_into(self, _socket, target: memoryview) -> int:
+            if not self._remaining:
+                return 0
+            copied = min(len(target), len(self._remaining))
+            target[:copied] = self._remaining[:copied]
+            self._remaining = self._remaining[copied:]
+            return copied
+
+    connector = MaKVNetworkConnector.__new__(MaKVNetworkConnector)
+    connector.loop = TruncatedSocketLoop()
+    with pytest.raises(ConnectionError, match="incomplete response"):
+        asyncio.run(connector._recv_into(object(), len(payload) + 1))
+
+
+def test_makv_network_stream_rejects_out_of_order_object_before_yield():
+    """A stream index mismatch must fail before a MemoryObj reaches restore."""
+    results: list = []
+    with pytest.raises(RuntimeError, match="response order mismatch"):
+        MaKVNetworkConnector._append_legacy_batch_result(
+            results,
+            {
+                "status": "ok",
+                "index": 1,
+                "found": True,
+            },
+            b"wrong-order-object",
+            expected_index=0,
+        )
+    assert results == []
+
+
+def test_makv_remote_stream_failure_exposes_only_complete_prefix(monkeypatch):
+    """A later transport failure must become a miss without losing the prefix."""
+    from lmcache.v1.memory_management import BytesBufferMemoryObj
+    import lmcache.v1.storage_backend.remote_backend as remote_backend_module
+
+    class Config:
+        remote_serde = "makv"
+        blocking_timeout_secs = 1.0
+
+    class StatsMonitor:
+        @staticmethod
+        def update_interval_remote_time_to_get_sync(_duration: float) -> None:
+            return None
+
+        @staticmethod
+        def get_current_retrieve_stats():
+            return None
+
+    class Deserializer:
+        @staticmethod
+        def deserialize(memory_obj):
+            return memory_obj
+
+    class Stream:
+        def __anext__(self):
+            return object()
+
+        def aclose(self):
+            return object()
+
+    class Future:
+        def __init__(self, result) -> None:
+            self.result_value = result
+
+        def result(self, _timeout):
+            if isinstance(self.result_value, BaseException):
+                raise self.result_value
+            return self.result_value
+
+        def cancel(self) -> None:
+            return None
+
+    outcomes = iter(
+        (
+            (0, BytesBufferMemoryObj(b"complete-prefix")),
+            ConnectionError("simulated later frame failure"),
+            None,
+        )
+    )
+
+    def fake_run_coroutine_threadsafe(_awaitable, _loop):
+        return Future(next(outcomes))
+
+    monkeypatch.setattr(
+        remote_backend_module.asyncio,
+        "run_coroutine_threadsafe",
+        fake_run_coroutine_threadsafe,
+    )
+
+    backend = RemoteBackend.__new__(RemoteBackend)
+    backend.config = Config()
+    backend.loop = object()
+    backend.stats_monitor = StatsMonitor()
+    backend.deserializer = Deserializer()
+    backend._get_blocking_failed_count = 0
+    values = list(
+        backend._iter_streaming_makv_get(
+            [dumb_cache_engine_key(703), dumb_cache_engine_key(704)],
+            lambda _keys: Stream(),
+        )
+    )
+
+    assert [None if value is None else bytes(value.byte_array) for value in values] == [
+        b"complete-prefix",
+        None,
+    ]
+    assert isinstance(getattr(values[0], "makv_restore_ready_ns", None), int)
+    assert backend.get_blocking_failed_count == 1
+
+
 def test_makv_batch_blob_is_zero_copy_and_rejects_bad_directory():
     blob = encode_batch_blob([b"first", None, b"third"])
     decoded = decode_batch_blob(blob, expected_count=3)
@@ -1387,6 +1675,139 @@ def test_makv_streaming_capability_survives_instrumented_connector():
         return [item async for item in wrapped.batched_get_streaming(["a", "b"])]
 
     assert asyncio.run(collect()) == [(0, "a"), (1, "b")]
+
+
+def test_stream_restore_timeline_counts_complete_objects_only():
+    """Timeline metrics describe only deserialized objects sent to the GPU."""
+    scope_id = RESTORE_METRICS.begin_restore_scope()
+    restore_ready_ns = time.perf_counter_ns()
+    RESTORE_METRICS.record_stream_restore_submission(
+        scope_id,
+        restore_ready_ns=restore_ready_ns,
+        submitted_ns=restore_ready_ns + 2_000_000,
+    )
+    RESTORE_METRICS.record_stream_restore_submission(
+        scope_id,
+        restore_ready_ns=restore_ready_ns + 3_000_000,
+        submitted_ns=restore_ready_ns + 6_000_000,
+    )
+
+    scope = RESTORE_METRICS.finish_restore_scope(scope_id)
+    snapshot = RESTORE_METRICS.snapshot()
+
+    assert scope.makv_restore_pipeline_streamed_objects == 2
+    assert scope.makv_restore_pipeline_receive_to_submit_time_ms == pytest.approx(
+        5.0
+    )
+    assert scope.makv_restore_pipeline_enqueue_span_ms == pytest.approx(4.0)
+    assert scope.makv_restore_pipeline_first_submit_delay_ms >= 0.0
+    assert scope.makv_restore_pipeline_scope_wall_time_ms >= 0.0
+    assert snapshot.makv_restore_pipeline_streamed_objects == 2
+
+
+def test_restore_ticket_cap_reaps_keepalive_before_growing_unbounded():
+    """A full ticket pool waits only for the oldest owned restore."""
+
+    class FakeEvent:
+        def __init__(self, complete: bool = False) -> None:
+            self.complete = complete
+            self.synchronize_calls = 0
+
+        def query(self) -> bool:
+            return self.complete
+
+        def synchronize(self) -> None:
+            self.synchronize_calls += 1
+            self.complete = True
+
+        def elapsed_time(self, _other) -> float:
+            return 1.0
+
+    class Keepalive:
+        pass
+
+    def add_ticket(
+        metrics: MaKVMetrics,
+        event: FakeEvent,
+        *,
+        keepalive: tuple[object, ...] = (),
+    ) -> None:
+        metrics.record_cuda_restore(
+            None,
+            h2d_start=event,
+            h2d_end=event,
+            compute_start=event,
+            kernel_end=event,
+            payload_bytes=1,
+            h2d_bytes=1,
+            kernel_launch_count=1,
+            keepalive=keepalive,
+            max_inflight_tickets=1,
+        )
+
+    metrics = MaKVMetrics()
+    first_event = FakeEvent()
+    owned = Keepalive()
+    owned_ref = weakref.ref(owned)
+    add_ticket(metrics, first_event, keepalive=(owned,))
+    del owned
+    gc.collect()
+    assert owned_ref() is not None
+
+    add_ticket(metrics, FakeEvent(complete=True))
+    gc.collect()
+    assert first_event.synchronize_calls == 1
+    assert owned_ref() is None
+
+    snapshot = metrics.snapshot()
+    assert snapshot.makv_restore_ticket_backpressure_waits == 1
+    assert snapshot.makv_restore_ticket_peak == 1
+    assert snapshot.makv_restore_ticket_reaped == 2
+    assert snapshot.makv_cuda_pending_traces == 0
+
+
+def test_restore_ticket_reset_waits_before_releasing_keepalive():
+    """Metrics reset cannot invalidate a pending non-blocking H2D source."""
+
+    class FakeEvent:
+        def __init__(self) -> None:
+            self.complete = False
+            self.synchronize_calls = 0
+
+        def query(self) -> bool:
+            return self.complete
+
+        def synchronize(self) -> None:
+            self.synchronize_calls += 1
+            self.complete = True
+
+        def elapsed_time(self, _other) -> float:
+            return 1.0
+
+    class Keepalive:
+        pass
+
+    metrics = MaKVMetrics()
+    event = FakeEvent()
+    owned = Keepalive()
+    owned_ref = weakref.ref(owned)
+    metrics.record_cuda_restore(
+        None,
+        h2d_start=event,
+        h2d_end=event,
+        compute_start=event,
+        kernel_end=event,
+        payload_bytes=1,
+        h2d_bytes=1,
+        kernel_launch_count=1,
+        keepalive=(owned,),
+    )
+    del owned
+    metrics.reset()
+    gc.collect()
+
+    assert event.synchronize_calls == 1
+    assert owned_ref() is None
 
 
 def test_makv_precision_risk_capability_survives_instrumented_connector():

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 
 # Standard
+from dataclasses import dataclass
 from typing import Any, AsyncIterator, List, Mapping, Optional
 from urllib.parse import urlparse
 import asyncio
@@ -36,6 +37,17 @@ from lmcache.v1.storage_backend.makv_remote.protocol import (
 
 _MAX_BATCH_KEYS = 256
 _DEFAULT_SOCKET_BUFFER_BYTES = 16 * 1024 * 1024
+_DEFAULT_STREAM_RECEIVE_PREFETCH_DEPTH = 2
+
+
+@dataclass(frozen=True)
+class _StreamReceiveFailure:
+    """Transport error forwarded from a background stream receiver."""
+
+    error: Exception
+
+
+_STREAM_RECEIVE_DONE = object()
 
 
 def _decode_batch_timing(value: Any) -> dict[str, Any] | None:
@@ -132,6 +144,15 @@ class MaKVNetworkConnector(RemoteConnector):
             int(
                 (config.extra_config or {}).get(
                     "makv_pinned_receive_min_bytes", 1 << 20
+                )
+            ),
+        )
+        self.stream_receive_prefetch_depth = max(
+            1,
+            int(
+                (config.extra_config or {}).get(
+                    "makv_stream_receive_prefetch_depth",
+                    _DEFAULT_STREAM_RECEIVE_PREFETCH_DEPTH,
                 )
             ),
         )
@@ -397,44 +418,15 @@ class MaKVNetworkConnector(RemoteConnector):
             if first_header.get("batch_stream_version") == BATCH_STREAM_VERSION:
                 if int(first_header.get("count", -1)) != len(keys):
                     raise RuntimeError("MaKV batch stream response count mismatch")
-                first_payload = await self._recv_into(sock, payload_length)
-                first_results: list[Optional[MemoryObj]] = []
-                self._append_legacy_batch_result(
-                    first_results, first_header, first_payload, expected_index=0
-                )
-                first = first_results[0]
-                if first is not None:
-                    first_result = first
-                stream_frame_count = 1
-                stream_bytes = len(first_payload)
-                yield 0, first
-                for index in range(1, len(keys)):
-                    header, payload = await asyncio.wait_for(
-                        self._read_socket_frame(sock), self.timeout
-                    )
-                    if (
-                        header.get("batch_stream_version")
-                        != BATCH_STREAM_VERSION
-                        or int(header.get("count", -1)) != len(keys)
-                    ):
-                        raise RuntimeError(
-                            "MaKV batch stream response metadata mismatch"
-                        )
-                    results: list[Optional[MemoryObj]] = []
-                    self._append_legacy_batch_result(
-                        results, header, payload, expected_index=index
-                    )
-                    value = results[0]
+                async for index, value in self._consume_stream_v1_prefetched(
+                    sock,
+                    keys,
+                    first_header=first_header,
+                    first_payload_length=payload_length,
+                ):
                     if value is not None and first_result is None:
                         first_result = value
-                    stream_frame_count += 1
-                    stream_bytes += len(payload)
                     yield index, value
-                CLIENT_METRICS.add(
-                    makv_client_get_stream_requests=1,
-                    makv_client_get_stream_frames=stream_frame_count,
-                    makv_client_get_stream_bytes=stream_bytes,
-                )
             elif first_header.get("batch_blob_version") == BATCH_BLOB_VERSION:
                 if int(first_header.get("count", -1)) != len(keys):
                     raise RuntimeError("MaKV batch blob response count mismatch")
@@ -553,6 +545,111 @@ class MaKVNetworkConnector(RemoteConnector):
                     makv_client_get_total_time_ms=timing["total_ms"],
                 )
             sock.close()
+
+    async def _consume_stream_v1_prefetched(
+        self,
+        sock: socket.socket,
+        keys: list[Any],
+        *,
+        first_header: dict[str, Any],
+        first_payload_length: int,
+    ) -> AsyncIterator[tuple[int, Optional[MemoryObj]]]:
+        """Consume complete stream_v1 objects through a bounded receive queue.
+
+        ``Queue.put`` blocks before another socket read when the consumer falls
+        behind. This intentionally lets the server's existing ``writer.drain``
+        observe TCP backpressure instead of accumulating whole MaKV objects in
+        Python memory.
+        """
+        queue: asyncio.Queue[
+            tuple[int, Optional[MemoryObj]] | _StreamReceiveFailure | object
+        ] = asyncio.Queue(maxsize=self.stream_receive_prefetch_depth)
+        producer = asyncio.create_task(
+            self._receive_stream_v1_objects(
+                sock,
+                keys,
+                first_header=first_header,
+                first_payload_length=first_payload_length,
+                queue=queue,
+            ),
+            name="makv-stream-receiver",
+        )
+        try:
+            while True:
+                item = await queue.get()
+                if item is _STREAM_RECEIVE_DONE:
+                    await producer
+                    return
+                if isinstance(item, _StreamReceiveFailure):
+                    await producer
+                    raise item.error
+                yield item
+        finally:
+            if not producer.done():
+                producer.cancel()
+            await asyncio.gather(producer, return_exceptions=True)
+
+    async def _receive_stream_v1_objects(
+        self,
+        sock: socket.socket,
+        keys: list[Any],
+        *,
+        first_header: dict[str, Any],
+        first_payload_length: int,
+        queue: asyncio.Queue[
+            tuple[int, Optional[MemoryObj]] | _StreamReceiveFailure | object
+        ],
+    ) -> None:
+        """Read independently framed objects until the bounded queue is full."""
+        stream_frame_count = 0
+        stream_bytes = 0
+        queue_peak = 0
+        backpressure_waits = 0
+
+        async def enqueue(
+            index: int, header: dict[str, Any], payload_length: int
+        ) -> None:
+            nonlocal stream_frame_count, stream_bytes, queue_peak, backpressure_waits
+            if (
+                header.get("batch_stream_version") != BATCH_STREAM_VERSION
+                or int(header.get("count", -1)) != len(keys)
+            ):
+                raise RuntimeError("MaKV batch stream response metadata mismatch")
+            payload = await asyncio.wait_for(
+                self._recv_into(sock, payload_length), self.timeout
+            )
+            results: list[Optional[MemoryObj]] = []
+            self._append_legacy_batch_result(
+                results, header, payload, expected_index=index
+            )
+            if queue.full():
+                backpressure_waits += 1
+            await queue.put((index, results[0]))
+            queue_peak = max(queue_peak, queue.qsize())
+            stream_frame_count += 1
+            stream_bytes += len(payload)
+
+        try:
+            await enqueue(0, first_header, first_payload_length)
+            for index in range(1, len(keys)):
+                header, payload_length = await asyncio.wait_for(
+                    self._read_socket_frame_header(sock), self.timeout
+                )
+                await enqueue(index, header, payload_length)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            await queue.put(_StreamReceiveFailure(error))
+            return
+
+        CLIENT_METRICS.add(
+            makv_client_get_stream_requests=1,
+            makv_client_get_stream_frames=stream_frame_count,
+            makv_client_get_stream_bytes=stream_bytes,
+            makv_client_get_stream_prefetch_peak=queue_peak,
+            makv_client_get_stream_prefetch_backpressure_waits=backpressure_waits,
+        )
+        await queue.put(_STREAM_RECEIVE_DONE)
 
     async def batched_get(self, keys: list[Any]) -> list[Optional[MemoryObj]]:
         if not keys:

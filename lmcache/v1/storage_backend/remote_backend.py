@@ -771,6 +771,10 @@ class RemoteBackend(StorageBackendInterface):
                     failed = True
                     result = None
                 deserialize_ms += (time.perf_counter() - deserialize_started) * 1000
+                if result is not None:
+                    # The GPU restore timeline begins only after the complete
+                    # framed object has been deserialized and validated.
+                    result.makv_restore_ready_ns = time.perf_counter_ns()
                 yield result
                 if result is None:
                     break

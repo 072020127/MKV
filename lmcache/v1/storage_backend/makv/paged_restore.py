@@ -122,12 +122,16 @@ def restore_makv_quantized_to_paged(
     skip_prefix_n_tokens: int = 0,
     require_cuda: bool = True,
     timing_scope: int | None = None,
+    h2d_stream: torch.cuda.Stream | None = None,
+    max_inflight_tickets: int | None = None,
 ) -> None:
     """Restore a MaKV object directly into final paged KV-cache buffers."""
     if require_cuda and not makv_paged_cuda_op_available():
         raise RuntimeError("MaKV direct-to-paged CUDA operator is unavailable")
     if device.type != "cuda" or not makv_paged_cuda_op_available():
         raise RuntimeError("MaKV paged restore requires the CUDA operator")
+    if max_inflight_tickets is not None and int(max_inflight_tickets) < 1:
+        raise ValueError("max_inflight_tickets must be at least one")
 
     cpu_started = time.perf_counter()
     plan = memory_obj.makv_metadata["plan"]
@@ -143,11 +147,13 @@ def restore_makv_quantized_to_paged(
     blob_pin_ms = (time.perf_counter() - blob_pin_started) * 1000
     raw_dtype = getattr(torch, str(plan["original_dtype"]).replace("torch.", ""))
     with torch.cuda.device(device):
-        stream = torch.cuda.current_stream(device)
+        compute_stream = torch.cuda.current_stream(device)
+        copy_stream = h2d_stream if h2d_stream is not None else compute_stream
         h2d_start = torch.cuda.Event(enable_timing=True)
         h2d_end = torch.cuda.Event(enable_timing=True)
+        compute_start = torch.cuda.Event(enable_timing=True)
         kernel_end = torch.cuda.Event(enable_timing=True)
-        h2d_start.record(stream)
+        h2d_start.record(copy_stream)
 
         view_validate_started = time.perf_counter()
         payloads = payload_tensors_from_obj(
@@ -184,22 +190,29 @@ def restore_makv_quantized_to_paged(
 
         # The object is aligned by the protocol encoder, so one byte-buffer
         # copy supplies zero-copy device views for positions and payloads.
-        # The helper retains a segment-level fallback for older objects.
-        gpu_blob = _copy_to_cuda(pinned_blob, device)
-        prepared_slot_mapping = _copy_to_cuda(prepared_slot_mapping, device)
-        gpu_payloads = payload_tensors_from_gpu_blob(
-            memory_obj,
-            gpu_blob,
-            cpu_payloads=payloads,
-        )
-        # The current CUDA ABI consumes float32 scales. This conversion is
-        # limited to the small scale arrays; the large payload remains one
-        # contiguous H2D transfer.
-        for bits in (8, 4, 2):
-            scales = gpu_payloads[bits]["scales"]
-            if scales.dtype != torch.float32:
-                gpu_payloads[bits]["scales"] = scales.to(torch.float32)
-        h2d_end.record(stream)
+        # Keep all copy-side work on the dedicated stream so the next object
+        # can transfer while the compute stream restores the previous one.
+        with torch.cuda.stream(copy_stream):
+            gpu_blob = _copy_to_cuda(pinned_blob, device)
+            prepared_slot_mapping = _copy_to_cuda(prepared_slot_mapping, device)
+            gpu_payloads = payload_tensors_from_gpu_blob(
+                memory_obj,
+                gpu_blob,
+                cpu_payloads=payloads,
+            )
+            # The current CUDA ABI consumes float32 scales. This conversion is
+            # limited to the small scale arrays; the large payload remains one
+            # contiguous H2D transfer.
+            for bits in (8, 4, 2):
+                scales = gpu_payloads[bits]["scales"]
+                if scales.dtype != torch.float32:
+                    gpu_payloads[bits]["scales"] = scales.to(torch.float32)
+            h2d_end.record(copy_stream)
+
+        # A paged write may only consume a fully transferred, validated
+        # object. This event is the sole cross-stream dependency.
+        compute_stream.wait_event(h2d_end)
+        compute_start.record(compute_stream)
 
         (
             raw16,
@@ -253,12 +266,13 @@ def restore_makv_quantized_to_paged(
             int(raw_dtype == torch.bfloat16),
             int(skip_prefix_n_tokens),
         )
-        kernel_end.record(stream)
+        kernel_end.record(compute_stream)
 
     RESTORE_METRICS.record_cuda_restore(
         timing_scope,
         h2d_start=h2d_start,
         h2d_end=h2d_end,
+        compute_start=compute_start,
         kernel_end=kernel_end,
         payload_bytes=payload_bytes,
         h2d_bytes=h2d_bytes,
@@ -266,6 +280,7 @@ def restore_makv_quantized_to_paged(
             int(payloads[bits]["positions"].numel() > 0)
             for bits in (16, 8, 4, 2)
         ),
+        max_inflight_tickets=max_inflight_tickets,
         # Hold the host sources and GPU inputs until kernel_end.  This is
         # required for a genuinely asynchronous H2D path.
         keepalive=(

@@ -59,6 +59,14 @@ _DEFAULT_SOCKET_BUFFER_BYTES = 16 * 1024 * 1024
 _DEFAULT_BATCH_STREAM_PREFETCH_DEPTH = 4
 _MAX_LIST_KEY_HASHES = 4096
 
+# These are live-manager defaults only.  Keep ScoutRankConfig's frozen v3
+# defaults unchanged so offline/reproducibility workflows retain their prior
+# behavior.
+_DEFAULT_LIVE_SCOUT_SCORING_VERSION = "v3_fast_1_exact_scalar_d22"
+_DEFAULT_LIVE_SCOUT_NUM_PROBES = 32
+_DEFAULT_LIVE_SCOUT_TAIL_PROBES = 16
+_DEFAULT_LIVE_SCOUT_PROBE_SELECTION = "mix32"
+
 
 def _configure_client_socket(
     writer: asyncio.StreamWriter, buffer_bytes: int
@@ -712,9 +720,35 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--scout-mode", choices=("fast", "balanced"), default="fast"
     )
+    parser.add_argument(
+        "--scout-scoring-version",
+        default=_DEFAULT_LIVE_SCOUT_SCORING_VERSION,
+        help=(
+            "ScoutRank scoring implementation used by live overlap. The "
+            "default is the exact scalar D22 fast path."
+        ),
+    )
     parser.add_argument("--scout-anchor-layers", default="14,28")
     parser.add_argument("--scout-observer-token-chunk-size", type=int, default=4096)
     parser.add_argument("--scout-expected-layers", type=int, default=28)
+    parser.add_argument(
+        "--scout-v3-num-probes",
+        type=int,
+        default=_DEFAULT_LIVE_SCOUT_NUM_PROBES,
+        help="Total live D22 probes; mix32 requires 32.",
+    )
+    parser.add_argument(
+        "--scout-v3-tail-probes",
+        type=int,
+        default=_DEFAULT_LIVE_SCOUT_TAIL_PROBES,
+        help="Tail probes reserved by the live D22 policy; mix32 requires 16.",
+    )
+    parser.add_argument(
+        "--scout-v3-probe-selection",
+        choices=("priority", "mix32"),
+        default=_DEFAULT_LIVE_SCOUT_PROBE_SELECTION,
+        help="Live D22 probe policy; mix32 uses 16 prompt-wide and 16 tail probes.",
+    )
     parser.add_argument(
         "--scout-context-policy",
         choices=("sliding_window", "error"),
@@ -871,6 +905,10 @@ async def run_server(args: argparse.Namespace) -> None:
             anchor_layers=_parse_list(args.scout_anchor_layers, int),
             observer_token_chunk_size=args.scout_observer_token_chunk_size,
             expected_layers=args.scout_expected_layers,
+            scoring_version=args.scout_scoring_version,
+            v3_num_probes=args.scout_v3_num_probes,
+            v3_tail_probes=args.scout_v3_tail_probes,
+            v3_probe_selection=args.scout_v3_probe_selection,
             context_policy=args.scout_context_policy,
             context_window=args.scout_context_window,
             context_left_tokens=args.scout_context_left_tokens,

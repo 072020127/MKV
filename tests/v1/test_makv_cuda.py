@@ -3,6 +3,8 @@
 """CUDA differential tests for MaKV contiguous and direct paged restore."""
 
 # Standard
+import gc
+
 # Third Party
 import pytest
 import torch
@@ -15,6 +17,7 @@ from lmcache.v1.gpu_connector.gpu_connectors import VLLMPagedMemGPUConnectorV2
 from lmcache.v1.gpu_connector.makv_restore import (
     begin_makv_restore_timing_scope,
     finish_makv_restore_timing_scope,
+    handoff_makv_restore_ready_event,
 )
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.makv.config import MaKVConfig
@@ -227,6 +230,8 @@ def _run_paths(
     memory_obj: MaKVQuantizedMemoryObj,
     dtype: torch.dtype,
     engine_format: int,
+    *,
+    use_separate_h2d_stream: bool = False,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
     plan = memory_obj.makv_metadata["plan"]
     layers = int(plan["num_layers"])
@@ -254,6 +259,7 @@ def _run_paths(
         device="cuda",
     )[:tokens].to(torch.int64)
     stream = torch.cuda.Stream()
+    h2d_stream = torch.cuda.Stream() if use_separate_h2d_stream else None
     with torch.cuda.stream(stream):
         contiguous = restore_makv_quantized_to_tensor(
             memory_obj,
@@ -281,6 +287,7 @@ def _run_paths(
             block_size=block_size,
             head_size=head_dim,
             engine_kv_format=lmcache_native.EngineKVFormat(engine_format),
+            h2d_stream=h2d_stream,
         )
     stream.synchronize()
     return path_a, path_b
@@ -300,6 +307,21 @@ def _run_paths(
 def test_direct_paged_matches_contiguous(dtype, bucket_ids):
     memory_obj = _quantized_object(dtype, bucket_ids)
     path_a, path_b = _run_paths(memory_obj, dtype, engine_format=1)
+    assert all(
+        torch.equal(left, right) for left, right in zip(path_a, path_b, strict=True)
+    )
+
+
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
+def test_direct_paged_separate_h2d_stream_matches_contiguous(dtype):
+    """The compute stream must wait for the dedicated H2D stream event."""
+    memory_obj = _quantized_object(dtype, [index % 4 for index in range(11)])
+    path_a, path_b = _run_paths(
+        memory_obj,
+        dtype,
+        engine_format=1,
+        use_separate_h2d_stream=True,
+    )
     assert all(
         torch.equal(left, right) for left, right in zip(path_a, path_b, strict=True)
     )
@@ -477,6 +499,28 @@ def test_direct_paged_rejects_duplicate_positions_before_write():
     assert torch.count_nonzero(cache).item() == 0
 
 
+def test_direct_paged_rejects_short_slot_mapping_before_write():
+    """Slot bounds are checked before an asynchronous paged write is queued."""
+    memory_obj = _quantized_object(
+        torch.float16,
+        [index % 4 for index in range(11)],
+    )
+    cache = torch.zeros((2, 5, 4, 3, 5), dtype=torch.float16, device="cuda")
+    ptrs = torch.tensor([cache.data_ptr(), cache.data_ptr()], device="cuda")
+    with pytest.raises(ValueError, match="slot_mapping is shorter"):
+        restore_makv_quantized_to_paged(
+            memory_obj,
+            device=torch.device("cuda"),
+            page_ptrs=ptrs,
+            slot_mapping=torch.arange(10, device="cuda"),
+            page_buffer_size=20,
+            block_size=4,
+            head_size=5,
+            engine_kv_format=lmcache_native.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS,
+        )
+    assert torch.count_nonzero(cache).item() == 0
+
+
 def test_direct_paged_cuda_events_report_h2d_and_kernel_time():
     """Timing must be based on completed CUDA events, not host launch time."""
     RESTORE_METRICS.reset()
@@ -519,6 +563,51 @@ def test_direct_paged_cuda_events_report_h2d_and_kernel_time():
     )
 
 
+def test_restore_ready_event_handoff_orders_current_stream_without_host_sync():
+    """A consumer-stream event wait makes paged KV visible without sync()."""
+    RESTORE_METRICS.reset()
+    memory_obj = _quantized_object(
+        torch.float16, [index % 4 for index in range(11)]
+    )
+    layers, tokens, heads, head_dim = 2, 11, 3, 5
+    cache = [
+        torch.zeros((2, 5, 4, heads, head_dim), device="cuda", dtype=torch.float16)
+        for _ in range(layers)
+    ]
+    ptrs = torch.tensor(
+        [tensor.data_ptr() for tensor in cache], dtype=torch.int64, device="cuda"
+    )
+    slots = torch.arange(tokens, device="cuda", dtype=torch.int64)
+    load_stream = torch.cuda.Stream()
+    h2d_stream = torch.cuda.Stream()
+    consumer_stream = torch.cuda.Stream()
+    marker = torch.zeros((), device="cuda", dtype=torch.int32)
+    scope = begin_makv_restore_timing_scope()
+    with torch.cuda.stream(load_stream):
+        restore_makv_quantized_to_paged(
+            memory_obj,
+            device=torch.device("cuda"),
+            page_ptrs=ptrs,
+            slot_mapping=slots,
+            page_buffer_size=20,
+            block_size=4,
+            head_size=head_dim,
+            engine_kv_format=lmcache_native.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS,
+            h2d_stream=h2d_stream,
+            timing_scope=scope,
+        )
+    with torch.cuda.stream(consumer_stream):
+        handoff_makv_restore_ready_event(load_stream, scope)
+        marker.add_(1)
+    consumer_stream.synchronize()
+    timing = finish_makv_restore_timing_scope(scope)
+
+    assert marker.item() == 1
+    assert torch.count_nonzero(cache[0]).item() > 0
+    assert timing["makv_restore_ready_event_handoffs"] == 1
+    assert timing["makv_cuda_pending_traces"] == 0
+
+
 def test_vllm_v2_connector_uses_direct_paged_restore(monkeypatch):
     layers, tokens, heads, head_dim = 2, 11, 3, 5
     memory_obj = _quantized_object(
@@ -556,6 +645,8 @@ def test_vllm_v2_connector_uses_direct_paged_restore(monkeypatch):
     connector.to_gpu(memory_obj, 0, tokens, kvcaches=caches, slot_mapping=slots)
     torch.cuda.synchronize()
     assert calls == 1
+    assert len(connector._makv_h2d_streams) == 1
+    assert next(iter(connector._makv_h2d_streams.values())) is not connector.load_stream
     assert memory_obj.tensor is None
     bad_connector = VLLMPagedMemGPUConnectorV2.from_metadata(
         metadata, use_gpu=False, device=torch.device("cuda")
@@ -622,4 +713,64 @@ def test_vllm_v2_connector_defers_stream_sync_for_makv_pipeline():
     assert all(
         torch.equal(expected, actual)
         for expected, actual in zip(expected_caches, actual_caches, strict=True)
+    )
+
+
+def test_vllm_v2_deferred_restore_keeps_multiple_inputs_alive():
+    """Queued H2D/kernel work remains valid after host objects are released."""
+    layers, tokens, heads, head_dim = 2, 11, 3, 5
+    metadata = LMCacheMetadata(
+        model_name="makv-vllm-deferred-lifetime",
+        world_size=1,
+        local_world_size=1,
+        worker_id=0,
+        local_worker_id=0,
+        kv_dtype=torch.float16,
+        kv_shape=(layers, 2, tokens, heads, head_dim),
+        chunk_size=tokens,
+    )
+    objects = [
+        _quantized_object(torch.float16, [index % 4 for index in range(tokens)]),
+        _quantized_object(torch.float16, [3 - (index % 4) for index in range(tokens)]),
+    ]
+    slots = torch.randperm(32, device="cuda")[: 2 * tokens].to(torch.int64)
+    expected = [
+        torch.zeros((2, 8, 4, heads, head_dim), device="cuda", dtype=torch.float16)
+        for _ in range(layers)
+    ]
+    actual = [torch.zeros_like(cache) for cache in expected]
+
+    expected_connector = VLLMPagedMemGPUConnectorV2.from_metadata(
+        metadata, use_gpu=False, device=torch.device("cuda")
+    )
+    expected_connector.batched_to_gpu(
+        objects,
+        [0, tokens],
+        [tokens, 2 * tokens],
+        kvcaches=expected,
+        slot_mapping=slots,
+    )
+
+    streamed_connector = VLLMPagedMemGPUConnectorV2.from_metadata(
+        metadata, use_gpu=False, device=torch.device("cuda")
+    )
+    scope = begin_makv_restore_timing_scope()
+    streamed_connector.batched_to_gpu(
+        objects,
+        [0, tokens],
+        [tokens, 2 * tokens],
+        kvcaches=actual,
+        slot_mapping=slots,
+        makv_timing_scope=scope,
+        makv_defer_synchronize=True,
+    )
+    objects.clear()
+    gc.collect()
+    streamed_connector.load_stream.synchronize()
+    timing = finish_makv_restore_timing_scope(scope)
+
+    assert timing["makv_restore_calls"] == 2
+    assert timing["makv_cuda_pending_traces"] == 0
+    assert all(
+        torch.equal(left, right) for left, right in zip(expected, actual, strict=True)
     )

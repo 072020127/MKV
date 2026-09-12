@@ -1108,6 +1108,7 @@ class LMCacheEngine:
                 "restored_memory_obj_ids": set(),
                 "restore_result": None,
                 "streamed_chunks": 0,
+                "ready_event_handoff": False,
             }
 
         reordered_chunks: List[ProcessedChunk] = []
@@ -1134,6 +1135,9 @@ class LMCacheEngine:
             if isinstance(restore_result, dict):
                 restore_result["makv_streaming_restore_chunks"] = int(
                     makv_stream_restore_state["streamed_chunks"]
+                )
+                restore_result["makv_restore_ready_event_handoff"] = int(
+                    makv_stream_restore_state["ready_event_handoff"]
                 )
                 retrieve_stats.detailed_metrics["makv_restore"] = restore_result
 
@@ -2282,7 +2286,9 @@ class LMCacheEngine:
                 from lmcache.v1.gpu_connector.makv_restore import (
                     begin_makv_restore_timing_scope,
                     finish_makv_restore_timing_scope,
+                    handoff_makv_restore_ready_event,
                     is_makv_quantized_memory_obj,
+                    record_makv_stream_restore_submission,
                 )
 
                 memory_objs = []
@@ -2298,6 +2304,9 @@ class LMCacheEngine:
                             continue
                         if makv_scope is None:
                             makv_scope = begin_makv_restore_timing_scope()
+                        record_makv_stream_restore_submission(
+                            makv_scope, memory_obj
+                        )
                         assert self.gpu_connector is not None
                         self.gpu_connector.batched_to_gpu(
                             [memory_obj],
@@ -2307,6 +2316,11 @@ class LMCacheEngine:
                                 **kwargs,
                                 "makv_timing_scope": makv_scope,
                                 "makv_defer_synchronize": True,
+                                "makv_max_inflight_restore_tickets": (
+                                    self.config.get_extra_config_value(
+                                        "makv_max_inflight_restore_tickets", 64
+                                    )
+                                ),
                             },
                         )
                         makv_stream_restore_state["restored_memory_obj_ids"].add(
@@ -2320,7 +2334,28 @@ class LMCacheEngine:
                     if makv_scope is not None:
                         assert self.gpu_connector is not None
                         try:
-                            self.gpu_connector.load_stream.synchronize()
+                            ready_event_handoff = (
+                                self.config.get_extra_config_value(
+                                    "makv_streaming_restore_ready_event", False
+                                )
+                            )
+                            if isinstance(ready_event_handoff, str):
+                                ready_event_handoff = (
+                                    ready_event_handoff.strip().lower()
+                                    in {"1", "true", "yes", "on"}
+                                )
+                            if bool(ready_event_handoff):
+                                makv_stream_restore_state["ready_event"] = (
+                                    handoff_makv_restore_ready_event(
+                                        self.gpu_connector.load_stream,
+                                        makv_scope,
+                                    )
+                                )
+                                makv_stream_restore_state[
+                                    "ready_event_handoff"
+                                ] = True
+                            else:
+                                self.gpu_connector.load_stream.synchronize()
                         finally:
                             restore_result = finish_makv_restore_timing_scope(
                                 makv_scope
